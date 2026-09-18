@@ -13,9 +13,11 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from tariffrag import __version__
 from tariffrag.config import settings
+from tariffrag.ingest import manifest as manifest_mod
 from tariffrag.ingest.spike import Verdict, render_report, spike_document
 
 app = typer.Typer(
@@ -73,6 +75,98 @@ def spike(
             "[bold red]At least one document is NO_GO.[/bold red] Drop it from the corpus."
         )
         raise typer.Exit(code=1)
+
+
+manifest_app = typer.Typer(
+    help="Build and inspect the corpus manifest.",
+    no_args_is_help=True,
+)
+app.add_typer(manifest_app, name="manifest")
+
+
+@manifest_app.command("build")
+def manifest_build() -> None:
+    """Probe every PDF under corpus/ and write corpus/manifest.yaml.
+
+    Carries over `retrieved_at` for documents whose content hash is unchanged, so
+    rebuilding does not churn the file.
+    """
+    previous = (
+        manifest_mod.load(settings.manifest_path) if settings.manifest_path.exists() else None
+    )
+    built = manifest_mod.build_manifest(settings.corpus_dir, settings.repo_root, previous)
+    manifest_mod.save(built, settings.manifest_path)
+
+    active = sum(1 for d in built.documents if d.is_ingestable)
+    console.print(
+        f"Wrote [bold]{settings.manifest_path.relative_to(settings.repo_root)}[/bold]: "
+        f"{len(built.documents)} documents, {active} ingestable."
+    )
+
+
+@manifest_app.command("show")
+def manifest_show() -> None:
+    """Print the manifest as a table."""
+    if not settings.manifest_path.exists():
+        console.print("[red]No manifest.[/red] Run `tariffrag manifest build` first.")
+        raise typer.Exit(code=2)
+
+    built = manifest_mod.load(settings.manifest_path)
+    table = Table(title=f"Corpus manifest ({len(built.documents)} documents)")
+    table.add_column("doc id", style="cyan", no_wrap=True)
+    table.add_column("title", max_width=42)
+    table.add_column("status")
+    table.add_column("pp", justify="right")
+    table.add_column("effective", max_width=30)
+    table.add_column("sha", style="dim", no_wrap=True)
+
+    status_style = {"active": "green", "reserved": "dim", "excluded": "red"}
+    for doc in built.documents:
+        eff = doc.primary_effective_date
+        if eff:
+            shown = eff.date.isoformat() if eff.date else eff.date_text
+            effective = f"{shown}  {eff.docket}"
+        else:
+            effective = "[dim]none recorded[/dim]"
+        style = status_style.get(doc.status.value, "")
+        table.add_row(
+            doc.doc_id,
+            doc.title,
+            f"[{style}]{doc.status.value}[/{style}]" if style else doc.status.value,
+            str(doc.page_count),
+            effective,
+            doc.source.sha256_pdf[:10],
+            style=None if doc.is_ingestable else "dim",
+        )
+    console.print(table)
+
+
+@manifest_app.command("diff")
+def manifest_diff() -> None:
+    """Compare the corpus on disk against the manifest, by content hash.
+
+    Exits non-zero on drift, so CI catches a corpus that no longer matches its
+    record.
+    """
+    if not settings.manifest_path.exists():
+        console.print("[red]No manifest.[/red] Run `tariffrag manifest build` first.")
+        raise typer.Exit(code=2)
+
+    built = manifest_mod.load(settings.manifest_path)
+    delta = manifest_mod.diff_manifest(built, settings.corpus_dir, settings.repo_root)
+
+    if delta.clean:
+        console.print(f"[green]Clean[/green] — {len(built.documents)} documents match.")
+        return
+
+    for doc_id in delta.added:
+        console.print(f"  [green]added[/green]    {doc_id}")
+    for doc_id in delta.removed:
+        console.print(f"  [red]removed[/red]  {doc_id}")
+    for doc_id in delta.changed:
+        console.print(f"  [yellow]changed[/yellow]  {doc_id}")
+    console.print("\nRun `tariffrag manifest build` to update the record.")
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":  # pragma: no cover

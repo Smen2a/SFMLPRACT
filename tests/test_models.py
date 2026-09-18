@@ -8,47 +8,83 @@ from tariffrag.models import (
     ISO,
     Chunk,
     CrossReference,
+    DocStatus,
     DocType,
     Document,
+    EffectiveDate,
+    Origin,
     RevisionSource,
     Section,
+    SourceRef,
+    TitleSource,
 )
 
 
 def _document(**overrides: object) -> Document:
     base: dict[str, object] = {
-        "doc_id": "isone:m20",
+        "doc_id": "isone:mr1:append_a",
         "iso": ISO.ISONE,
-        "doc_type": DocType.MANUAL,
-        "title": "ISO New England Manual M-20",
-        "source_index_url": "https://www.iso-ne.com/manuals",
-        "resolved_pdf_url": "https://www.iso-ne.com/static-assets/m20_rev27.pdf",
-        "retrieved_at": datetime(2026, 9, 18, tzinfo=UTC),
-        "sha256_pdf": "a" * 64,
-        "sha256_canonical_text": "b" * 64,
-        "page_count": 212,
+        "doc_type": DocType.TARIFF,
+        "title": "MARKET MONITORING, REPORTING AND MARKET POWER MITIGATION",
+        "title_source": TitleSource.COVER_PAGE,
+        "source": SourceRef(
+            origin=Origin.SUPPLIED,
+            path="corpus/isone/mr1/mr1_append_a.pdf",
+            retrieved_at=datetime(2026, 9, 18, tzinfo=UTC),
+            sha256_pdf="a" * 64,
+        ),
+        "page_count": 103,
+        "status": DocStatus.ACTIVE,
         "extractor": "pdfplumber",
-        "extractor_version": "0.11.4",
-        "chunker_version": "0",
+        "extractor_version": "0.11.10",
     }
     base.update(overrides)
     return Document(**base)  # type: ignore[arg-type]
 
 
-def test_cite_label_includes_revision_and_effective_date() -> None:
+def test_cite_label_uses_the_primary_effective_date() -> None:
     doc = _document(
-        revision="27",
-        effective_date=date(2023, 4, 6),
-        revision_source=RevisionSource.FILENAME,
+        effective_dates=(
+            EffectiveDate("5/3/25", "ER25-2149-000", tuple(range(6, 103)), date(2025, 5, 3)),
+            EffectiveDate("March 31, 2026", "ER26-925-000", (1, 2, 3), date(2026, 3, 31)),
+        ),
+        revision_source=RevisionSource.COVER_PAGE,
     )
-    assert doc.cite_label() == "ISO New England Manual M-20 (Rev. 27, eff. 2023-04-06)"
+    assert doc.cite_label().endswith("(eff. 2025-05-03)")
+
+
+def test_cite_label_resolves_the_stamp_for_a_given_page() -> None:
+    """ISO-NE versions at finer granularity than the file.
+
+    A section on page 1 is in force from a different date than the bulk of the
+    document, so a citation must resolve its own page's stamp.
+    """
+    doc = _document(
+        effective_dates=(
+            EffectiveDate("5/3/25", "ER25-2149-000", tuple(range(6, 103)), date(2025, 5, 3)),
+            EffectiveDate("March 31, 2026", "ER26-925-000", (1, 2, 3), date(2026, 3, 31)),
+        )
+    )
+    assert "eff. 2026-03-31" in doc.cite_label(page=1)
+    assert "eff. 2025-05-03" in doc.cite_label(page=50)
 
 
 def test_cite_label_omits_absent_qualifiers() -> None:
-    """A document whose revision could not be recovered still renders cleanly."""
+    """Appendices C, D and G carry no stamp at all, and must still render."""
     doc = _document()
-    assert doc.revision_source is RevisionSource.UNKNOWN
-    assert doc.cite_label() == "ISO New England Manual M-20"
+    assert doc.primary_effective_date is None
+    assert doc.cite_label() == "MARKET MONITORING, REPORTING AND MARKET POWER MITIGATION"
+
+
+def test_unparseable_stamp_falls_back_to_raw_text() -> None:
+    doc = _document(effective_dates=(EffectiveDate("sometime", "ER1-1-1", (1,), None),))
+    assert "eff. sometime" in doc.cite_label()
+
+
+def test_only_active_documents_are_ingestable() -> None:
+    assert _document().is_ingestable
+    assert not _document(status=DocStatus.RESERVED).is_ingestable
+    assert not _document(status=DocStatus.EXCLUDED).is_ingestable
 
 
 def test_render_breadcrumb_appends_the_section_itself() -> None:

@@ -78,7 +78,7 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 
 - [x] **0a** Project scaffold, data model, lint/type/test tooling, CI
 - [x] **0b** Parser spike, validated against the real Market Rule 1 corpus
-- [ ] **0c** Content-hashed manifest, with per-section effective dates and docket numbers
+- [x] **0c** Content-hashed manifest, with per-section effective dates and docket numbers
 - [ ] **1** Extraction → canonical text + page map → section tree → parse report
 - [ ] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
 - [ ] **3** First ~30 gold questions and the Layer-1 retrieval eval
@@ -95,6 +95,26 @@ Evaluation (phase 3) deliberately precedes answering (phase 4), so retrieval is 
 `corpus/isone/mr1/` holds the complete **ISO-NE Market Rule 1** — Section III of the Transmission, Markets and Services Tariff: sections 1–12, 13–14, 14, 15, and appendices A–L. 16 PDFs, 7.3 MB, 806 pages, committed so the repo is clone-and-run.
 
 Four appendices (B, E, H, J) are `[RESERVED]` placeholders and are excluded. Nothing is dropped for being unreadable — every substantive document has a usable text layer.
+
+## The manifest
+
+`corpus/manifest.yaml` is the reproducibility contract: per document an identity, a title and where that title came from, a content hash, the pages each effective-date stamp governs, and whether the document takes part in the corpus at all.
+
+```bash
+tariffrag manifest build   # probe every PDF, write the manifest
+tariffrag manifest show    # render it as a table
+tariffrag manifest diff    # compare disk against the record; non-zero on drift
+```
+
+Three properties are deliberate:
+
+**Rebuilds are byte-stable.** `retrieved_at` carries over for any document whose content hash is unchanged. A manifest that produced a diff on every build would stop being a record of change.
+
+**Nothing is invented.** These documents were supplied rather than fetched, so every `url` is `null` — a plausible-looking URL nobody verified would put a false claim into the provenance chain that citations rest on. Appendices C, D and G carry no effective-date stamp anywhere, so they record `unknown` rather than a guess.
+
+**Effective dates are per section, not per document.** Sections 13–14 carry four stamps covering pages `6-102`, `4-5,103-182,232-235`, `206-230` and `1-3`. `Document.cite_label(page=N)` resolves the stamp governing that page, so a citation to page 1 reports March 2026 while the document's primary date is May 2025.
+
+Status is machine-readable (`active` / `reserved` / `excluded`), so Phase 1 skips the four reserved appendices without a hard-coded list. `reserved` is kept distinct from `excluded` for the same reason `EMPTY` is distinct from `NO_GO`: one loses nothing, the other loses content.
 
 ## The parser spike
 

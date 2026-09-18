@@ -20,7 +20,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TARIFFRAG_", env_file=".env", extra="ignore")
 
     # --- Paths -------------------------------------------------------------
+    repo_root: Path = _REPO_ROOT
     data_dir: Path = _REPO_ROOT / "data"
+    corpus_dir: Path = _REPO_ROOT / "corpus"
     manifest_path: Path = _REPO_ROOT / "corpus" / "manifest.yaml"
     gold_dir: Path = _REPO_ROOT / "evals" / "gold"
     runs_dir: Path = _REPO_ROOT / "evals" / "runs"

@@ -29,6 +29,7 @@ import re
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -36,6 +37,8 @@ from typing import Any, NamedTuple
 import pdfplumber
 from rich.console import Console
 from rich.table import Table
+
+from tariffrag.models import EffectiveDate, TitleSource
 
 __all__ = [
     "CrossRefAudit",
@@ -134,6 +137,28 @@ names unless it is stripped before any font comparison.
 """
 
 _RESERVED = re.compile(r"\[?\s*RESERVED", re.IGNORECASE)
+
+_COVER_BOILERPLATE = re.compile(r"^(SECTION\s+[IVXLCDM]+|MARKET\s+RULE\s+\d+)\.?$", re.IGNORECASE)
+"""Masthead lines shared by every cover page, carrying no title information."""
+
+MAX_TITLE_LINES = 6
+"""A cover-page title never runs longer than this."""
+
+MIN_TITLE_UPPERCASE = 0.6
+"""Fraction of a title line's letters that must be uppercase.
+
+Cover-page titles are set in capitals ("STANDARD MARKET DESIGN"); the body
+prose that can follow them on the same page is not. Appendix L runs title
+straight into prose with no blank separator and its date stamp only in the
+footer, so without this the whole page becomes the title.
+"""
+
+_APPENDIX_MARKER = re.compile(r"^APPENDIX\s+[A-Z]\.?$", re.IGNORECASE)
+"""The title follows this line, so anything gathered before it is discarded."""
+
+_STAMP_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%B %d, %Y")
+"""The three forms ISO-NE uses. Two-digit years resolve by Python's %y rule
+(00-68 -> 20xx), so "3/31/26" is 2026 -- a tariff will never carry a 1926 date."""
 
 _MULTI_SENTENCE = re.compile(r"\.\s+[A-Z]")
 """A sentence boundary inside the remainder: prose, not a heading."""
@@ -332,13 +357,6 @@ class CrossRefAudit:
     exist and silently corrupts every boundary after it."""
 
 
-@dataclass(frozen=True, slots=True)
-class EffectiveDate:
-    date_text: str
-    docket: str
-    pages: int
-
-
 @dataclass(slots=True)
 class SpikeReport:
     path: Path
@@ -350,6 +368,8 @@ class SpikeReport:
     cross_refs: CrossRefAudit
     toc_pages: tuple[int, ...] = ()
     effective_dates: tuple[EffectiveDate, ...] = ()
+    title: str = ""
+    title_source: TitleSource = TitleSource.FILENAME
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -491,21 +511,106 @@ def _find_repeated_lines(
     return sorted(repeated, key=lambda r: r.top)
 
 
-def _find_effective_dates(lines: list[Line]) -> list[EffectiveDate]:
-    """Collect the per-page effective date and docket stamp.
+def _parse_stamp_date(text: str) -> date | None:
+    for fmt in _STAMP_DATE_FORMATS:
+        try:
+            return datetime.strptime(text.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
 
-    This is versioning metadata, not just furniture to strip: ISO-NE gives
-    effective dates at finer granularity than the document, so different sections
-    of one PDF can be in force from different dates.
+
+def _looks_like_title(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    uppercase = sum(1 for c in letters if c.isupper()) / len(letters)
+    return uppercase >= MIN_TITLE_UPPERCASE
+
+
+def _extract_title(
+    lines: list[Line], accepted: list[HeaderCandidate], fallback: str
+) -> tuple[str, TitleSource]:
+    """Recover a document title, recording which of three sources supplied it.
+
+    Measured across Market Rule 1: twelve documents carry a cover page, three
+    open directly on their first heading, and two are bare ``[RESERVED.]`` with
+    no title at all.
+
+    Titles are kept exactly as printed rather than case-normalised. "AUCTION
+    REVENUE RIGHTS AND INCREMENTAL ARRs" is the document's own rendering, and
+    title-casing it would produce "Arrs".
     """
-    counter: Counter[tuple[str, str]] = Counter()
+    page_one = [line for line in lines if line.page_no == 1]
+
+    # A cover page never opens with a section id; a section file always does.
+    if page_one and parse_section_id(page_one[0].text) is None:
+        parts: list[str] = []
+        for line in page_one:
+            text = line.text.strip()
+            if _EFFECTIVE_DATE.search(text):
+                break
+            if _COVER_BOILERPLATE.match(text) or _RESERVED.match(text):
+                continue
+            if _APPENDIX_MARKER.match(text):
+                # Appendix K omits the masthead, so the marker -- not a fixed
+                # line offset -- is what anchors the title.
+                parts.clear()
+                continue
+            if parse_section_id(text) or not _looks_like_title(text):
+                break
+            parts.append(text)
+            if len(parts) >= MAX_TITLE_LINES:
+                break
+        title = " ".join(parts).strip()
+        if title:
+            return title, TitleSource.COVER_PAGE
+
+        # A reserved appendix has a cover page whose only content *is* the
+        # reserved marker. "APPENDIX B RESERVED FOR FUTURE USE" is the
+        # document's own wording and beats falling through to a filename.
+        marker_parts = [
+            line.text.strip()
+            for line in page_one
+            if not _COVER_BOILERPLATE.match(line.text.strip())
+            and not _EFFECTIVE_DATE.search(line.text)
+        ]
+        if marker_parts:
+            return " ".join(marker_parts).strip(), TitleSource.COVER_PAGE
+
+    if accepted:
+        first = accepted[0]
+        remainder, _ = _heading_shape(first.line.text, first.section_id)
+        if remainder:
+            return remainder.rstrip("."), TitleSource.FIRST_HEADING
+
+    return fallback, TitleSource.FILENAME
+
+
+def _find_effective_dates(lines: list[Line]) -> list[EffectiveDate]:
+    """Collect each effective-date stamp and the pages it governs.
+
+    Versioning metadata, not furniture to strip: ISO-NE gives effective dates at
+    finer granularity than the document, so different sections of one PDF are in
+    force from different dates. Retaining the page numbers is what lets Phase 1
+    attribute a date to a section spanning a given page range.
+    """
+    pages_by_stamp: dict[tuple[str, str], set[int]] = defaultdict(set)
     for line in lines:
         if match := _EFFECTIVE_DATE.search(line.text):
-            counter[(match.group("date").strip(), match.group("docket").strip())] += 1
-    return [
-        EffectiveDate(date_text=date, docket=docket, pages=n)
-        for (date, docket), n in counter.most_common()
+            key = (match.group("date").strip(), match.group("docket").strip())
+            pages_by_stamp[key].add(line.page_no)
+
+    stamps = [
+        EffectiveDate(
+            date_text=date_text,
+            docket=docket,
+            pages=tuple(sorted(pages)),
+            date=_parse_stamp_date(date_text),
+        )
+        for (date_text, docket), pages in pages_by_stamp.items()
     ]
+    return sorted(stamps, key=lambda eff: (-len(eff.pages), eff.date_text))
 
 
 def _find_toc_pages(lines: list[Line], furniture_tops: set[float]) -> set[int]:
@@ -819,6 +924,8 @@ def spike_document(pdf_path: Path) -> SpikeReport:
             candidates=(),
             sequence=None,
             cross_refs=CrossRefAudit(0, 0, 0),
+            title=_extract_title(lines, [], pdf_path.stem)[0],
+            title_source=_extract_title(lines, [], pdf_path.stem)[1],
             notes=[note],
         )
 
@@ -831,6 +938,9 @@ def spike_document(pdf_path: Path) -> SpikeReport:
     sequence = _validate_sequence(candidates, demoted)
     cross_refs = _audit_cross_refs(lines, candidates)
     effective_dates = _find_effective_dates(lines)
+    title, title_source = _extract_title(
+        lines, [c for c in candidates if c.accepted], pdf_path.stem
+    )
 
     notes: list[str] = []
     if not fonts.headings_typographically_distinct:
@@ -871,6 +981,8 @@ def spike_document(pdf_path: Path) -> SpikeReport:
         cross_refs=cross_refs,
         toc_pages=tuple(sorted(toc_pages)),
         effective_dates=tuple(effective_dates),
+        title=title,
+        title_source=title_source,
         notes=notes,
     )
 
@@ -891,6 +1003,9 @@ def render_report(report: SpikeReport, console: Console, *, show_candidates: int
     console.print()
     console.rule(f"[{style}]{report.path.name} — {report.verdict.value.upper()}[/{style}]")
     console.print(f"[dim]{gloss}[/dim]\n")
+
+    if report.title:
+        console.print(f"[bold]Title[/bold]      {report.title}  [dim]({report.title_source})[/dim]")
 
     layer = report.text_layer
     console.print(
