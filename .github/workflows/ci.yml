@@ -1,39 +1,48 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: ["**"]
+  pull_request:
 
-defaults:
-  run:
-    shell: bash
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: ${{ matrix.platform.name }} ${{ matrix.config.name }}
-    runs-on: ${{ matrix.platform.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-        - { name: Windows VS2019, os: windows-2019  }
-        - { name: Windows VS2022, os: windows-2022  }
-        - { name: Linux GCC,      os: ubuntu-latest }
-        - { name: Linux Clang,    os: ubuntu-latest, flags: -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ }
-        - { name: macOS,          os: macos-latest  }
-        config:
-        - { name: Shared, flags: -DBUILD_SHARED_LIBS=TRUE }
-        - { name: Static, flags: -DBUILD_SHARED_LIBS=FALSE }
-
+  check:
+    name: Lint, type-check, test
+    runs-on: ubuntu-latest
     steps:
-    - name: Install Linux Dependencies
-      if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install libxrandr-dev libxcursor-dev libxi-dev libudev-dev libflac-dev libvorbis-dev libgl1-mesa-dev libegl1-mesa-dev libfreetype-dev
+      - uses: actions/checkout@v4
 
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
-    - name: Configure
-      run: cmake -B build ${{matrix.platform.flags}} ${{matrix.config.flags}}
+      - name: Set up Python
+        run: uv python install 3.11
 
-    - name: Build
-      run: cmake --build build --config Release
+      - name: Install
+        # Core + dev only. The local-models extra pulls torch and is exercised
+        # in the ingest/index jobs, not in lint and unit tests.
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Ruff (format)
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy
+
+      - name: Pytest
+        run: pytest
+
+      # Layer-1 retrieval evaluation is deterministic and makes zero API calls,
+      # so it runs on every push once an index fixture exists. It fails the
+      # build on a >2-point recall regression.
+      # - name: Retrieval eval (no API calls)
+      #   run: tariffrag eval --suite retrieval --fail-under-delta 2

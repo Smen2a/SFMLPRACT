@@ -1,6 +1,23 @@
-build
-out
-.cache
-.idea
-.vs
-.vscode
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project data — rebuilt reproducibly by `tariffrag ingest`
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors / OS
+.idea/
+.vs/
+.vscode/
+.DS_Store
