@@ -80,7 +80,7 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 - [x] **0b** Parser spike, validated against the real Market Rule 1 corpus
 - [x] **0c** Content-hashed manifest, with per-section effective dates and docket numbers
 - [x] **1** Extraction → canonical text + page map → section tree → cross-reference resolution
-- [ ] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
+- [x] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
 - [ ] **3** First ~30 gold questions and the Layer-1 retrieval eval
 - [ ] **4** `search_result` assembly, the answer call, grounding verification
 - [ ] **5** Full eval harness; gold set to ~120; judge validation
@@ -149,6 +149,31 @@ ISO-NE inserts amendments as **suffixed sections** rather than renumbering: `III
 Segment sort keys are scaled so a suffix sorts inside the gap between integers (`4` < `4A` < `4B` < `5`). Tests assert that ordering rather than the encoding, so the representation can change without rewriting a table of magic numbers.
 
 A second defect surfaced in the same pass: a numbering scheme with a lone member beside a well-populated one is noise — a stray `84.1` from a table, an `Appendix I` reference that took a sentence as its title. Per-scheme LIS cannot catch these, since one member is trivially an increasing sequence. Eight corpus-wide, now demoted. The rule is relative, not absolute: Appendix I is genuinely numbered in the `plain` scheme with 48 headings.
+
+## Retrieval
+
+```bash
+tariffrag index build -e hashing     # chunk + index (local | hashing | none)
+tariffrag search "what terminates a Capacity Supply Obligation"
+```
+
+789 chunks and 5,377 citation blocks from 12 documents. Median chunk 512 tokens, ceiling 1,200, no overlap.
+
+**Chunking.** A section that fits becomes one chunk; an oversized one splits at paragraph boundaries, never mid-sentence, with `continued_from` / `continues_in` linking the pieces. Sections too small to stand alone — a parent whose span holds only its heading, common in a nine-deep hierarchy — lead the chunk holding their first child's prose, so the parent heading rides along as context. Merging never crosses a parent boundary: a chunk spanning two parents has a breadcrumb that is a lie about half its content.
+
+Paragraphs are recovered from the original page geometry, since canonical text is one line per visual line. Getting that wrong is quiet: comparing indentation against the page margin rather than against the previous line made every continuation line inside an indented block its own paragraph, which cut the median citation block to 17 words. Fixed, it is 46.
+
+**Lexical is half the system, not a checkbox.** The FTS5 tokenizer keeps `.` and `-` inside tokens, so `III.13.1.2` and `Pay-for-Performance` survive as single terms; without that they shatter and the exact-match queries this corpus is full of stop working. Breadcrumb is a separate column at 0.3 weight — folded into the body it makes every chunk under `III.13` match "capacity" and saturates the score.
+
+**Fusion** is weighted Reciprocal Rank Fusion (k=60). Ranks rather than scores, because BM25 is unbounded and query-length dependent while cosine sits in a tight band; per-query normalisation would force both tops to 1.0 and destroy the signal saying *whether anything matched at all*. That signal is why the raw top BM25 and max cosine are carried through: fused ranks are always 1..k regardless of match quality, so RRF alone can never say "nothing relevant exists", which is exactly what abstention needs.
+
+**A named section is a lookup, not a ranking problem.** Switching hybrid retrieval on immediately regressed `III.13.3.4A`: lexical had the right section at rank 1, but a chunk ranked bm25 #2 and present in the dense list outranked it under equal-weight RRF. Query analysis now detects section ids that exist in the index and pins them. The same analysis flags temporal cues ("in 2019", "used to"), which the corpus snapshot cannot answer.
+
+### Honest limits
+
+**The dense half is verified in plumbing, not in quality.** `huggingface.co` is blocked by this environment's egress policy, so BGE weights cannot be downloaded here. `LocalEmbedder` is the intended default and is **untested in this sandbox**; what runs here is `HashingEmbedder`, a deterministic bag-of-hashed-words with no notion of synonymy. It exists so the pipeline runs with no model download and so the ablation table has a floor — a dense row that cannot beat hashed bag-of-words is not earning its dependency. Run `tariffrag index build -e local` on a machine that can reach the model hub.
+
+**Abstention thresholds are uncalibrated.** The raw-score floors in `config.py` are placeholders. Calibrating them needs the unanswerable items in the gold set, which is phase 3; until then the "nothing matched" warning fires unreliably and should not be trusted.
 
 ## The parser spike
 

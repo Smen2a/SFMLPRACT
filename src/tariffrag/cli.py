@@ -17,9 +17,13 @@ from rich.table import Table
 
 from tariffrag import __version__
 from tariffrag.config import settings
+from tariffrag.index import build as index_build
+from tariffrag.index import store as index_store
+from tariffrag.index.dense import Embedder, HashingEmbedder, LocalEmbedder
 from tariffrag.ingest import manifest as manifest_mod
 from tariffrag.ingest import pipeline as pipeline_mod
 from tariffrag.ingest.spike import Verdict, render_report, spike_document
+from tariffrag.retrieve.pipeline import retrieve as retrieve_chunks
 
 app = typer.Typer(
     name="tariffrag",
@@ -245,6 +249,89 @@ def outline(
         label = section.section_id or "(front matter)"
         console.print(f"{indent}[cyan]{label}[/cyan]  {section.heading}  [dim]{pages}[/dim]")
         shown += 1
+
+
+index_app = typer.Typer(help="Build and query the retrieval index.", no_args_is_help=True)
+app.add_typer(index_app, name="index")
+
+
+def _make_embedder(kind: str) -> Embedder | None:
+    """Resolve the embedder name to an implementation."""
+    if kind == "none":
+        return None
+    if kind == "hashing":
+        return HashingEmbedder()
+    if kind == "local":
+        return LocalEmbedder(settings.embedding_model)
+    raise typer.BadParameter(f"unknown embedder {kind!r}; use local, hashing or none")
+
+
+@index_app.command("build")
+def index_build_cmd(
+    embedder: Annotated[
+        str,
+        typer.Option("--embedder", "-e", help="local | hashing | none"),
+    ] = "hashing",
+) -> None:
+    """Chunk the ingested corpus and build the index."""
+    if not settings.manifest_path.exists():
+        console.print("[red]No manifest.[/red] Run `tariffrag manifest build` first.")
+        raise typer.Exit(code=2)
+
+    manifest = manifest_mod.load(settings.manifest_path)
+    try:
+        result = index_build.build_index(
+            manifest, settings.text_dir, settings.index_path, _make_embedder(embedder)
+        )
+    except index_build.StaleIngestError as error:
+        console.print(f"[red]Stale ingest:[/red] {error}")
+        raise typer.Exit(code=1) from None
+
+    console.print(
+        f"Indexed [bold]{result.chunks}[/bold] chunks and {result.blocks} citation blocks "
+        f"from {result.documents} documents"
+        + (f", embedded with {result.embedder}." if result.embedder else ", lexical only.")
+    )
+
+
+@app.command()
+def search(
+    query: Annotated[str, typer.Argument(help="Free-text query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 8,
+    embedder: Annotated[str, typer.Option("--embedder", "-e")] = "hashing",
+) -> None:
+    """Search the index, showing how each retriever contributed."""
+    if not settings.index_path.exists():
+        console.print("[red]No index.[/red] Run `tariffrag index build` first.")
+        raise typer.Exit(code=2)
+
+    connection = index_store.connect(settings.index_path)
+    result = retrieve_chunks(
+        connection,
+        query,
+        embedder=_make_embedder(embedder),
+        candidates=settings.candidates_per_retriever,
+        limit=limit,
+        weight_lexical=settings.weight_lexical,
+        weight_dense=settings.weight_dense,
+    )
+
+    if result.looks_unanswerable(
+        min_bm25=settings.min_bm25_score, min_cosine=settings.min_cosine_score
+    ):
+        console.print(
+            "[yellow]Nothing matched well enough to answer from.[/yellow] "
+            f"[dim](top bm25 {result.top_lexical_score}, "
+            f"top cosine {result.top_dense_score})[/dim]\n"
+        )
+
+    for rank, chunk in enumerate(result.chunks, start=1):
+        console.print(
+            f"[bold]{rank}.[/bold] [cyan]{chunk.section_id or '(front matter)'}[/cyan] "
+            f"[dim]{chunk.doc_id} {chunk.pages} · {chunk.hit.explain()}[/dim]"
+        )
+        console.print(f"   [dim]{chunk.breadcrumb[:96]}[/dim]")
+        console.print(f"   {chunk.text[:200].strip()}...\n")
 
 
 if __name__ == "__main__":  # pragma: no cover
