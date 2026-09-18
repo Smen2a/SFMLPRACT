@@ -14,7 +14,7 @@ from tariffrag.ingest.manifest import (
     load,
     save,
 )
-from tariffrag.ingest.spike import _parse_stamp_date
+from tariffrag.ingest.structure import _parse_stamp_date
 from tariffrag.models import DocStatus, TitleSource, format_page_ranges, parse_page_ranges
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

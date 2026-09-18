@@ -12,17 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from tariffrag.ingest.spike import (
+from tariffrag.ingest.spike import SpikeReport, Verdict, spike_document
+from tariffrag.ingest.structure import (
     _EFFECTIVE_DATE,
     MARGIN_BAND_RATIO,
     MIN_FURNITURE_PAGES,
-    SpikeReport,
-    Verdict,
     _heading_shape,
     _longest_increasing,
     parse_section_id,
-    spike_document,
 )
+from tariffrag.models import TitleSource
 
 FIXTURES = Path(__file__).parent / "fixtures"
 CORPUS = Path(__file__).resolve().parents[1] / "corpus" / "isone" / "mr1"
@@ -332,3 +331,22 @@ def test_lettered_segments(text: str, display: str, scheme: str) -> None:
     parsed = parse_section_id(text)
     assert parsed is not None
     assert (parsed.display, parsed.scheme) == (display, scheme)
+
+
+def test_title_does_not_swallow_a_page_without_a_cover(nested: SpikeReport) -> None:
+    """A document whose first page opens with a running header, not a title.
+
+    The reserved-marker fallback used to fire whenever the cover-page branch
+    found nothing, taking the whole page as the title. It is now gated on the
+    marker actually being present.
+    """
+    assert nested.title == "Forward Capacity Market"
+    assert nested.title_source is TitleSource.FIRST_HEADING
+    assert len(nested.title) < 80
+
+
+def test_spike_report_delegates_to_one_structure(nested: SpikeReport) -> None:
+    """The structure is the single source of truth; the report only judges it."""
+    assert nested.candidates is nested.structure.candidates
+    assert nested.text_layer is nested.structure.text_layer
+    assert nested.title == nested.structure.title
