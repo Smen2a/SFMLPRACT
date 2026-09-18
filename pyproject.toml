@@ -24,7 +24,15 @@ dependencies = [
 # Embedder / Reranker protocols, so the core install stays light.
 local-models = ["sentence-transformers>=3.0"]
 api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
-dev = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.6", "mypy>=1.11", "types-PyYAML"]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-PyYAML",
+    # Regenerates the test fixture PDFs; the fixtures themselves are committed.
+    "reportlab>=4.2",
+]
 
 [project.scripts]
 tariffrag = "tariffrag.cli:app"

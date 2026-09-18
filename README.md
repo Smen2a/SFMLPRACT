@@ -75,7 +75,7 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 ## Phases
 
 - [x] **0a** Project scaffold, data model, lint/type/test tooling, CI
-- [ ] **0b** Parser spike on three representative PDFs — *de-risks the highest-risk component before committing to a library*
+- [x] **0b** Parser spike — *de-risks the highest-risk component before committing to a library*
 - [ ] **0c** Link resolver, fetcher, and content-hashed manifest
 - [ ] **1** Extraction → canonical text + page map → section tree → parse report
 - [ ] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
@@ -87,6 +87,28 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 - [ ] **8** FastAPI + web UI with clickable citation highlighting
 
 Evaluation (phase 3) deliberately precedes answering (phase 4), so retrieval is tuned against evidence rather than vibes. The UI is last: a UI built before the eval is how these projects end up looking impressive and being wrong.
+
+## The parser spike
+
+The section-structure parser is the highest-risk component: chunk quality, breadcrumbs, gold section ids, cross-reference resolution and citation rendering all assume `III.13.1.2.3` boundaries are recoverable from PDF text. `tariffrag spike` measures whether that holds, per document, before any of it gets built.
+
+```bash
+tariffrag spike path/to/manual.pdf --show-candidates 40
+```
+
+It reports a **GO / DEGRADED / NO_GO** verdict from five checks: is there a usable text layer; is the running header/footer strippable; are headings typographically distinct; do section ids form a monotone sequence; and — the number that matters — how many wrapped cross-references were misread as headings. It exits non-zero on NO_GO so it can gate a pipeline run.
+
+Running it against the fixtures produced two design corrections that would otherwise have surfaced much later:
+
+**Title-casing is a hard gate, not a weighted signal.** Line wrapping puts `III.14 shall be construed to limit...` at the start of a line, where numbering alone cannot tell it from a heading. Scored as merely one weak signal short, such lines passed at 0.75 and polluted the section tree. The asymmetry justifies a hard rule: missing an oddly-formatted heading costs one section, while admitting a false one fabricates a section and corrupts every boundary after it.
+
+**Page furniture is defined positionally, not just by recurrence.** Detecting running headers by "same text at the same height on most pages" also flagged repeated body sentences. Real furniture lives in the top and bottom margins, so the margin band is part of the definition.
+
+The fixtures in `tests/fixtures/` each encode one hazard — deep nesting, the cross-reference trap, headings set in body type, and an image-only scan. They are committed and byte-deterministic (regenerate with `python tests/fixtures/make_fixtures.py`).
+
+One result worth stating, since it is the load-bearing claim of the whole cascade: the flat-typography fixture still recovers **every** heading. Typography is a bonus signal; numbering, the prose gate, and sequence consistency carry the work.
+
+These fixtures prove the detector reacts correctly when a hazard is present. They cannot tell you whether real ISO PDFs contain those hazards — so the spike must still be run against real ISO-NE and NYISO documents before the ingest pipeline is built. That run is the actual go/no-go gate.
 
 ## Development
 
