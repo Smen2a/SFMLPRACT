@@ -50,6 +50,10 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# ISO-NE stamps every tariff page with an en dash between the effective date
+# and the FERC docket number. These characters are corpus data we must match
+# literally, not typographic slips.
+allowed-confusables = ["–", "—"]
 
 [tool.mypy]
 python_version = "3.11"

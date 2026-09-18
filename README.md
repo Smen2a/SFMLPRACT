@@ -68,47 +68,84 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 
 ## Scope
 
-**In:** ISO-NE Market Rule 1 and appendices, ISO-NE manuals (M-11, M-20, M-28), NYISO MST/OATT and manuals (11, 12, ICAP 4), at a single point-in-time snapshot.
+**In now:** ISO-NE Market Rule 1 and its appendices, at a single point-in-time snapshot (see [Corpus](#corpus)).
+
+**In later:** ISO-NE manuals (M-11, M-20, M-28), then NYISO MST/OATT and manuals (11, 12, ICAP 4) for cross-ISO comparison.
 
 **Out, on purpose:** multi-version corpora and time-travel queries, section-level revision diffing, FERC order tracking, per-section effective-date indexing. In their place, queries carrying temporal cues ("in 2019", "used to", "prior to") are detected and abstained on, naming the snapshot actually held.
 
 ## Phases
 
 - [x] **0a** Project scaffold, data model, lint/type/test tooling, CI
-- [x] **0b** Parser spike — *de-risks the highest-risk component before committing to a library*
-- [ ] **0c** Link resolver, fetcher, and content-hashed manifest
+- [x] **0b** Parser spike, validated against the real Market Rule 1 corpus
+- [ ] **0c** Content-hashed manifest, with per-section effective dates and docket numbers
 - [ ] **1** Extraction → canonical text + page map → section tree → parse report
 - [ ] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
 - [ ] **3** First ~30 gold questions and the Layer-1 retrieval eval
 - [ ] **4** `search_result` assembly, the answer call, grounding verification
 - [ ] **5** Full eval harness; gold set to ~120; judge validation
 - [ ] **6** Glossary and cross-reference expansion, reranking — each with its ablation row
-- [ ] **7** NYISO corpus and cross-ISO comparison queries
+- [ ] **7** ISO-NE manuals and the NYISO corpus (needs the fetcher); cross-ISO comparison queries
 - [ ] **8** FastAPI + web UI with clickable citation highlighting
 
 Evaluation (phase 3) deliberately precedes answering (phase 4), so retrieval is tuned against evidence rather than vibes. The UI is last: a UI built before the eval is how these projects end up looking impressive and being wrong.
+
+## Corpus
+
+`corpus/isone/mr1/` holds the complete **ISO-NE Market Rule 1** — Section III of the Transmission, Markets and Services Tariff: sections 1–12, 13–14, 14, 15, and appendices A–L. 16 PDFs, 7.3 MB, 806 pages, committed so the repo is clone-and-run.
+
+Four appendices (B, E, H, J) are `[RESERVED]` placeholders and are excluded. Nothing is dropped for being unreadable — every substantive document has a usable text layer.
 
 ## The parser spike
 
 The section-structure parser is the highest-risk component: chunk quality, breadcrumbs, gold section ids, cross-reference resolution and citation rendering all assume `III.13.1.2.3` boundaries are recoverable from PDF text. `tariffrag spike` measures whether that holds, per document, before any of it gets built.
 
 ```bash
-tariffrag spike path/to/manual.pdf --show-candidates 40
+tariffrag spike corpus/isone/mr1/*.pdf --show-candidates 40
 ```
 
-It reports a **GO / DEGRADED / NO_GO** verdict from five checks: is there a usable text layer; is the running header/footer strippable; are headings typographically distinct; do section ids form a monotone sequence; and — the number that matters — how many wrapped cross-references were misread as headings. It exits non-zero on NO_GO so it can gate a pipeline run.
+It returns **GO / DEGRADED / EMPTY / NO_GO** per document and exits non-zero on `NO_GO`. `EMPTY` is deliberately distinct from `NO_GO`: an intentionally blank tariff section has nothing to recover, and conflating it with an unreadable scan sends you hunting for an OCR fix that cannot exist.
 
-Running it against the fixtures produced two design corrections that would otherwise have surfaced much later:
+### Results on Market Rule 1
 
-**Title-casing is a hard gate, not a weighted signal.** Line wrapping puts `III.14 shall be construed to limit...` at the start of a line, where numbering alone cannot tell it from a heading. Scored as merely one weak signal short, such lines passed at 0.75 and polluted the section tree. The asymmetry justifies a hard rule: missing an oddly-formatted heading costs one section, while admitting a false one fabricates a section and corrupts every boundary after it.
+| | |
+|---|---|
+| Headings recovered | **1,216** across 806 pages |
+| Sequence violations | **0** |
+| Cross-references misread as headings | **0** (from 836 inline references in Sections 13–14 alone) |
+| Verdicts | 7 GO, 5 DEGRADED, 4 EMPTY, 0 NO_GO |
 
-**Page furniture is defined positionally, not just by recurrence.** Detecting running headers by "same text at the same height on most pages" also flagged repeated body sentences. Real furniture lives in the top and bottom margins, so the margin band is part of the definition.
+Deepest hierarchy recovered is seven levels (`III.13.1.4.1.1.2.6`). The seven remaining numbering gaps are real — `III.13.7.1.2` simply does not exist in the tariff.
 
-The fixtures in `tests/fixtures/` each encode one hazard — deep nesting, the cross-reference trap, headings set in body type, and an image-only scan. They are committed and byte-deterministic (regenerate with `python tests/fixtures/make_fixtures.py`).
+### What measurement changed
 
-One result worth stating, since it is the load-bearing claim of the whole cascade: the flat-typography fixture still recovers **every** heading. Typography is a bonus signal; numbering, the prose gate, and sequence consistency carry the work.
+Every one of these was found by running against real text, and each had been wrong in a way that reasoning alone did not catch:
 
-These fixtures prove the detector reacts correctly when a hazard is present. They cannot tell you whether real ISO PDFs contain those hazards — so the spike must still be run against real ISO-NE and NYISO documents before the ingest pipeline is built. That run is the actual go/no-go gate.
+**Title-casing is a hard gate, not a weighted signal.** Wrapping puts `III.14 shall be construed to limit...` at the start of a line. Scored as one weak signal short, such lines passed at 0.75 and polluted the tree.
+
+**Sequence demotion needs a longest increasing subsequence, not a greedy walk.** A greedy monotonic walk lets one bad acceptance set an unreachable watermark that demotes every legitimate heading after it. In Appendix A the running `Appendix A` header sorted above every `III.A.x` id and cost **180 real headings**. An LIS drops the outlier instead of the tail.
+
+**Numbering schemes must be compared separately.** `Appendix A` and `III.A.1` have incomparable sort keys; validating them as one sequence manufactures violations that are artefacts of the comparison.
+
+**Page furniture is positional, low-variance, and recurrent — all three.** Text matching misses ISO-NE footers, which carry a per-page effective date and so take several textual forms. Exact position misses them too, because the footer drifts between bands (710.5 on 97 pages, 709.2 on 83, 734.7 on 23). Position alone over-matches, flagging the first body line of every page. Only the conjunction works.
+
+**Reserved subsections are real tree nodes.** ISO-NE repeals in place, leaving `III.13.1.1.2.5.2. [Reserved.]`. `[` is not uppercase, so the title gate rejected them — manufacturing seven false gaps.
+
+**Font subset prefixes fragment font identity.** The same face appears as `CPJYEE+TimesNewRomanPSMT` and `MEJGOK+TimesNewRomanPSMT`; the tag must be stripped before comparison.
+
+**Contents pages mimic headings perfectly.** Sections 1–12 open with a genuine 33-page table of contents listing every section in Market Rule 1. Detected by id density per page rather than by the literal phrase.
+
+### A finding that changed the design
+
+Every page carries `Effective Date: 3/31/26 – Docket No. ER26-925-000`, and **the dates differ within a single document** — Sections 13–14 contain four, covering 97, 86, 25 and 3 pages. ISO-NE versions at finer granularity than the file, so effective dates and FERC docket numbers are captured per section rather than per document. That is richer than the per-document versioning originally planned.
+
+### Fixtures
+
+`tests/fixtures/` holds four synthetic PDFs, each encoding one hazard in isolation — deep nesting, the cross-reference trap, headings set in body type, and an image-only scan. They are committed and byte-deterministic (regenerate with `python tests/fixtures/make_fixtures.py`).
+
+They prove the detector reacts correctly to a hazard when present; only the real corpus shows which hazards actually occur. Both layers are in the test suite.
+
+One fixture result is worth stating, because it is the load-bearing claim of the cascade: the flat-typography fixture still recovers **every** heading. Typography is a bonus signal; numbering, the prose gate, and sequence consistency carry the work.
 
 ## Development
 
@@ -122,11 +159,13 @@ pytest
 
 Local embedding and reranking models live in the `local-models` extra (`uv pip install -e ".[dev,local-models]"`), since they pull torch and sit behind the `Embedder` / `Reranker` protocols.
 
-### Corpus
+### Corpus and the index
 
-`corpus/manifest.yaml` is committed; PDFs and the built index are not — `tariffrag ingest` rebuilds them reproducibly, and a 300 MB binary in git helps nobody.
+`corpus/manifest.yaml` and the Market Rule 1 PDFs are committed; the built index is not — `tariffrag ingest` rebuilds it reproducibly from the manifest, keyed by content hash.
 
-The fetcher is rate-limited and sends an identifying user-agent. These are public regulatory filings, but there is no reason to hammer the sites. Documents can also be registered manually by dropping PDFs into `data/pdfs/`, so the pipeline is never hard-blocked on scraping.
+Committing 7.3 MB of source PDFs is a deliberate reversal of the usual rule. It makes the repo clone-and-run, which is worth more here than repo slimness. If the manuals and NYISO push the corpus past roughly 50 MB, this moves to fetch-on-demand.
+
+Documents are registered by dropping PDFs into `corpus/` and recording them in the manifest, so the pipeline never depends on a scraper. A fetcher arrives in phase 7 for documents not yet supplied; it will be rate-limited and send an identifying user-agent, since there is no reason to hammer the ISO sites.
 
 ## License
 

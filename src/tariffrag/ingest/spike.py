@@ -11,29 +11,35 @@ spike finds out cheaply, per document, and returns a verdict:
 ``GO``
     Structure is recoverable using the full signal cascade.
 ``DEGRADED``
-    Recoverable, but the typography signal is unusable (headings are not
-    visually distinct), so detection leans on numbering and sequence alone.
+    Recoverable, but a signal is unavailable or the sequence is still noisy.
+``EMPTY``
+    An intentionally blank tariff section (``[RESERVED]``). Excluded from the
+    corpus, but nothing is lost -- distinct from ``NO_GO`` so nobody goes
+    looking for an OCR fix for a document that has no content to recover.
 ``NO_GO``
-    No usable text layer. Claude's citations require extractable text, so an
-    image-only document is not citable at all and must be dropped from the
-    corpus, with the exclusion stated in the README.
+    Content exists but is not extractable -- a scan. Claude's citations require
+    a text layer, so such a document cannot be cited and must be dropped with
+    the exclusion stated in the README.
 """
 
 from __future__ import annotations
 
+import bisect
 import re
 import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pdfplumber
 from rich.console import Console
 from rich.table import Table
 
 __all__ = [
+    "CrossRefAudit",
+    "ParsedId",
     "SpikeReport",
     "Verdict",
     "parse_section_id",
@@ -46,8 +52,15 @@ __all__ = [
 MIN_CHARS_PER_PAGE = 100
 """Below this median, treat the document as having no usable text layer."""
 
-REPEATED_LINE_PAGE_RATIO = 0.6
-"""Fraction of pages a line must recur on (at the same height) to be furniture."""
+REPEATED_LINE_PAGE_RATIO = 0.15
+"""Fraction of pages a furniture band must cover.
+
+Deliberately low, because the variant-ratio rule below is what actually
+separates furniture from body text. Measured on Market Rule 1, the footer
+occupies two distinct bands -- one covering 77% of pages and a second covering
+20% where the body text runs short -- so a high threshold silently drops the
+second one.
+"""
 
 BAND_TOLERANCE = 3.0
 """Vertical tolerance, in points, for "the same height" on another page."""
@@ -55,24 +68,89 @@ BAND_TOLERANCE = 3.0
 MARGIN_BAND_RATIO = 0.12
 """Running headers/footers live in the top/bottom 12% of the page.
 
-Without this positional constraint, body text that happens to repeat at the
-same height on enough pages is misclassified as furniture -- which the spike
-caught on its first run against the fixtures.
+Without this positional constraint, body text that happens to repeat at the same
+height on enough pages is misclassified as furniture.
 """
+
+MIN_FURNITURE_PAGES = 2
+"""A band must recur on at least this many pages to be "running" furniture.
+
+A percentage alone is meaningless on a short document: one page out of two is
+50% coverage but is not recurrence.
+"""
+
+MAX_FURNITURE_VARIANT_RATIO = 0.25
+"""Distinct text variants a furniture position may have, per page it occupies.
+
+Position alone is not enough: the first body line of each page also sits at a
+consistent height. A running header repeats -- few variants across many pages
+(ISO-NE footers vary only by effective date: 3 forms over 235 pages) -- whereas
+body text differs on every page, giving roughly one variant per page.
+"""
+
+TOC_ID_DENSITY = 0.5
+"""A page where this fraction of lines parse as section ids is a contents page."""
+
+RESERVED_MAX_CHARS = 400
+"""A reserved placeholder carries only cover boilerplate and a marker.
+
+ISO-NE publishes repealed or not-yet-used appendices as one page reading
+``[RESERVED]`` under the usual cover text, which lands above the text-layer
+threshold. Appendix L, by contrast, is a genuine one-page appendix with 1,451
+characters of substance, so the marker alone is not sufficient evidence.
+"""
+
+MAX_HEADING_REMAINDER = 120
+"""Longer than this and the line is prose, not a title."""
 
 HEADING_SCORE_THRESHOLD = 0.6
 
 _ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
-_ROMAN_DOTTED = re.compile(r"^(?P<roman>[IVXLCDM]+)(?P<rest>(?:\.\d+)+)\b")
-_PLAIN_DOTTED = re.compile(r"^(?P<num>\d+(?:\.\d+)*)\b")
+_ROMAN_SEGMENTED = re.compile(r"^(?P<roman>[IVXLCDM]+)(?P<rest>(?:\.(?:\d+|[A-Z]))+)\b")
+"""Market Rule 1 numbering, in all three observed forms.
+
+``III.13.1.2.3`` (body), ``III.A.1.1`` (appendix) and ``III.13.A.1`` (a lettered
+subsection inside a numbered one) differ only in whether a given segment is a
+number or a letter, so one pattern covers them rather than three.
+"""
+
 _LETTERED = re.compile(r"^(?P<kind>Appendix|Attachment|Schedule)\s+(?P<letter>[A-Z])\b")
+
+_PLAIN_DOTTED = re.compile(r"^(?P<num>\d+(?:\.\d+)*)\b")
+"""Manual style: ``2.1.3``."""
 
 _INLINE_REF = re.compile(
     r"\b(?:Section|Sections|Appendix|Appendices|Attachment|Schedule)\s+"
-    r"(?:[IVXLCDM]+(?:\.\d+)+|\d+(?:\.\d+)*|[A-Z])\b"
+    r"(?:[IVXLCDM]+(?:\.[A-Z0-9]+)+|\d+(?:\.\d+)*|[A-Z])\b"
 )
 """Matches a cross-reference such as ``as defined in Section III.12.2``."""
+
+_SUBSET_PREFIX = re.compile(r"^[A-Z]{6}\+")
+"""Embedded-font subset tag, e.g. ``CPJYEE+TimesNewRomanPSMT``.
+
+The tag differs per file and per subset, so the same face appears under several
+names unless it is stripped before any font comparison.
+"""
+
+_RESERVED = re.compile(r"\[?\s*RESERVED", re.IGNORECASE)
+
+_MULTI_SENTENCE = re.compile(r"\.\s+[A-Z]")
+"""A sentence boundary inside the remainder: prose, not a heading."""
+
+_EFFECTIVE_DATE = re.compile(
+    # ISO-NE separates the date from the docket with an en or em dash, so the
+    # dash class is written as explicit escapes rather than literal characters.
+    r"Effective\s+Date:\s*(?P<date>[^\u2013\u2014\-]+?)\s*[\u2013\u2014-]\s*"
+    # ISO-NE writes the docket label as "Docket No.", "Docket #", or omits it.
+    r"(?:Docket\s*(?:No\.?|#):?\s*)?(?P<docket>[A-Z]{2}\d[\w-]*)",
+    re.IGNORECASE,
+)
+"""ISO-NE stamps every page with its effective date and FERC docket number."""
+
+
+def _base_font(name: str) -> str:
+    return _SUBSET_PREFIX.sub("", name)
 
 
 def _roman_to_int(text: str) -> int | None:
@@ -86,38 +164,56 @@ def _roman_to_int(text: str) -> int | None:
     return total or None
 
 
-def parse_section_id(text: str) -> tuple[str, tuple[int, ...]] | None:
+class ParsedId(NamedTuple):
+    """A parsed section id plus the numbering scheme that produced it.
+
+    The scheme matters for sequence validation: ``Appendix A`` and ``III.A.1``
+    come from different numbering systems and their sort keys are not mutually
+    comparable. Validating them as one sequence lets a stray id from one scheme
+    invalidate every heading in the other.
+    """
+
+    display: str
+    sort_key: tuple[int, ...]
+    scheme: str
+
+
+def parse_section_id(text: str) -> ParsedId | None:
     """Parse a section id at the start of ``text``.
 
-    Returns the normalized display id and an integer tuple used for ordering,
-    or ``None`` if the text does not begin with a recognizable id.
-
-    >>> parse_section_id("III.13.1.2 Qualification")
-    ('III.13.1.2', (3, 13, 1, 2))
+    >>> parse_section_id("III.13.1.2 Qualification").display
+    'III.13.1.2'
+    >>> parse_section_id("III.A.1.1 Mission Statement").scheme
+    'roman_letter'
     >>> parse_section_id("The Market Participant shall")
     """
     stripped = text.strip()
 
-    if match := _ROMAN_DOTTED.match(stripped):
-        roman = match.group("roman")
-        major = _roman_to_int(roman)
+    if match := _ROMAN_SEGMENTED.match(stripped):
+        major = _roman_to_int(match.group("roman"))
         if major is None:
             return None
-        minors = tuple(int(part) for part in match.group("rest").split(".") if part)
-        return f"{roman}{match.group('rest')}", (major, *minors)
+        rest = match.group("rest")
+        segments = [part for part in rest.split(".") if part]
+        # Letters sort above numbers at the same depth, so a lettered segment can
+        # never collide with a numbered one.
+        key = tuple(int(seg) if seg.isdigit() else 1000 + ord(seg) for seg in segments)
+        # Only the appendix form -- a letter directly after the roman major -- is
+        # a separate numbering scheme. A lettered segment deeper in the tree
+        # belongs to the body sequence and must be validated alongside it.
+        scheme = "roman_letter" if segments and not segments[0].isdigit() else "roman_dotted"
+        return ParsedId(f"{match.group('roman')}{rest}", (major, *key), scheme)
 
     if match := _LETTERED.match(stripped):
         letter = match.group("letter")
-        kind = match.group("kind")
-        return f"{kind} {letter}", (ord(letter),)
+        return ParsedId(f"{match.group('kind')} {letter}", (ord(letter),), "lettered")
 
     if match := _PLAIN_DOTTED.match(stripped):
         num = match.group("num")
-        # A bare integer is far more often a page number or list marker than a
-        # section heading, so require at least one dot.
+        # A bare integer is far more often a page number or list marker.
         if "." not in num:
             return None
-        return num, tuple(int(part) for part in num.split("."))
+        return ParsedId(num, tuple(int(part) for part in num.split(".")), "plain")
 
     return None
 
@@ -128,6 +224,7 @@ def parse_section_id(text: str) -> tuple[str, tuple[int, ...]] | None:
 class Verdict(StrEnum):
     GO = "go"
     DEGRADED = "degraded"
+    EMPTY = "empty"
     NO_GO = "no_go"
 
 
@@ -151,10 +248,21 @@ class TextLayerReport:
     total_chars: int
     median_chars_per_page: float
     empty_page_ratio: float
+    image_page_ratio: float
+    reserved_marker: bool
 
     @property
     def has_text_layer(self) -> bool:
         return self.median_chars_per_page >= MIN_CHARS_PER_PAGE
+
+    @property
+    def is_reserved_placeholder(self) -> bool:
+        """An intentionally blank tariff section, not a failed extraction."""
+        return (
+            self.reserved_marker
+            and self.total_chars < RESERVED_MAX_CHARS
+            and self.image_page_ratio <= 0.5
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +278,13 @@ class RepeatedLine:
     text: str
     top: float
     page_ratio: float
+    variants: int = 1
+    """Distinct text variants seen at this position.
+
+    ISO-NE footers carry a per-page effective date, so one footer legitimately
+    has many textual forms at a single position -- which is why furniture is
+    identified positionally rather than by matching text.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +292,7 @@ class HeaderCandidate:
     line: Line
     section_id: str
     sort_key: tuple[int, ...]
+    scheme: str
     signals: dict[str, float]
     score: float
     rejected_reason: str | None = None
@@ -185,12 +301,24 @@ class HeaderCandidate:
     def accepted(self) -> bool:
         return self.rejected_reason is None and self.score >= HEADING_SCORE_THRESHOLD
 
+    def demoted(self, reason: str) -> HeaderCandidate:
+        return HeaderCandidate(
+            self.line,
+            self.section_id,
+            self.sort_key,
+            self.scheme,
+            self.signals,
+            self.score,
+            reason,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SequenceReport:
     accepted_ids: tuple[str, ...]
     violations: tuple[str, ...]
     gaps: tuple[str, ...]
+    demoted: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,20 +326,17 @@ class CrossRefAudit:
     """How the document's cross-references interacted with heading detection."""
 
     inline_refs_seen: int
-    """Mid-line references such as ``as defined in Section III.12.2``."""
     prose_lines_starting_with_id: int
-    """Wrapped prose whose line happens to begin with a bare section id.
-
-    This is the dominant hazard: line wrapping puts ``III.14 shall be construed
-    ...`` at the start of a line, where it is indistinguishable from a heading by
-    numbering alone.
-    """
     misread_as_headings: int
-    """How many of those were accepted. Must be zero.
+    """Must be zero: a promoted reference fabricates a section that does not
+    exist and silently corrupts every boundary after it."""
 
-    A promoted reference fabricates a section that does not exist and silently
-    corrupts every downstream boundary, so this is the metric that matters.
-    """
+
+@dataclass(frozen=True, slots=True)
+class EffectiveDate:
+    date_text: str
+    docket: str
+    pages: int
 
 
 @dataclass(slots=True)
@@ -223,6 +348,8 @@ class SpikeReport:
     candidates: tuple[HeaderCandidate, ...]
     sequence: SequenceReport | None
     cross_refs: CrossRefAudit
+    toc_pages: tuple[int, ...] = ()
+    effective_dates: tuple[EffectiveDate, ...] = ()
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -231,6 +358,8 @@ class SpikeReport:
 
     @property
     def verdict(self) -> Verdict:
+        if self.text_layer.is_reserved_placeholder:
+            return Verdict.EMPTY
         if not self.text_layer.has_text_layer:
             return Verdict.NO_GO
         if self.cross_refs.misread_as_headings:
@@ -249,7 +378,7 @@ def _dominant_font(chars: list[dict[str, Any]]) -> tuple[str, float]:
     if not chars:
         return ("", 0.0)
     counter = Counter(
-        (str(c.get("fontname", "")), round(float(c.get("size", 0)), 1)) for c in chars
+        (_base_font(str(c.get("fontname", ""))), round(float(c.get("size", 0)), 1)) for c in chars
     )
     (font, size), _ = counter.most_common(1)[0]
     return (font, size)
@@ -258,16 +387,22 @@ def _dominant_font(chars: list[dict[str, Any]]) -> tuple[str, float]:
 def _read_lines(pdf_path: Path) -> tuple[list[Line], TextLayerReport, float]:
     lines: list[Line] = []
     chars_per_page: list[int] = []
+    pages_with_images = 0
     page_height = 0.0
+    reserved = False
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
             page_height = max(page_height, float(page.height))
             chars_per_page.append(len(page.chars))
+            if page.images:
+                pages_with_images += 1
             for raw in page.extract_text_lines():
                 text = str(raw.get("text", "")).strip()
                 if not text:
                     continue
+                if _RESERVED.search(text):
+                    reserved = True
                 font, size = _dominant_font(list(raw.get("chars", [])))
                 lines.append(
                     Line(
@@ -290,17 +425,39 @@ def _read_lines(pdf_path: Path) -> tuple[list[Line], TextLayerReport, float]:
             if page_count
             else 1.0
         ),
+        image_page_ratio=pages_with_images / page_count if page_count else 0.0,
+        reserved_marker=reserved,
     )
     return lines, report, page_height
+
+
+def _cluster_positions(tops: list[float]) -> list[list[float]]:
+    """Group vertical positions that are the same line allowing for drift."""
+    clusters: list[list[float]] = []
+    for top in sorted(tops):
+        if clusters and top - clusters[-1][-1] <= BAND_TOLERANCE:
+            clusters[-1].append(top)
+        else:
+            clusters.append([top])
+    return clusters
 
 
 def _find_repeated_lines(
     lines: list[Line], page_count: int, page_height: float
 ) -> list[RepeatedLine]:
-    """Find running headers and footers: same text, same height, most pages.
+    """Find running headers and footers positionally, with clustering.
 
-    These must be stripped before char offsets are assigned, or they pollute
-    every chunk and shift every citation span.
+    Three measured facts shape this, none of which held under the obvious
+    implementation:
+
+    1. Matching on text fails -- ISO-NE stamps each page with its own effective
+       date, so one footer takes several textual forms.
+    2. Exact position fails -- the footer drifts between bands (710.5 on 97
+       pages, 709.2 on 83, 734.7 on 23), so no single height dominates. Nearby
+       positions must be clustered.
+    3. Position alone over-matches -- the first body line of each page is just as
+       positionally stable as a header. What separates them is variance: a footer
+       has 3 text forms across 235 pages, body text has one per page.
     """
     if page_count < 2 or page_height <= 0:
         return []
@@ -308,23 +465,75 @@ def _find_repeated_lines(
     top_band = page_height * MARGIN_BAND_RATIO
     bottom_band = page_height * (1.0 - MARGIN_BAND_RATIO)
 
-    buckets: dict[tuple[str, float], set[int]] = defaultdict(set)
-    for line in lines:
-        if top_band < line.top < bottom_band:
-            continue  # body text, not page furniture
-        # Digits are normalized away so "Page 3" and "Page 4" collapse together.
-        normalized = re.sub(r"\d+", "#", line.text)
-        buckets[(normalized, line.top)].add(line.page_no)
+    margin_lines = [ln for ln in lines if not (top_band < ln.top < bottom_band)]
+    if not margin_lines:
+        return []
 
-    repeated = [
-        RepeatedLine(text=text, top=top, page_ratio=len(pages) / page_count)
-        for (text, top), pages in buckets.items()
-        if len(pages) / page_count >= REPEATED_LINE_PAGE_RATIO
-    ]
+    repeated: list[RepeatedLine] = []
+    for cluster in _cluster_positions([ln.top for ln in margin_lines]):
+        members = {round(t, 1) for t in cluster}
+        group = [ln for ln in margin_lines if round(ln.top, 1) in members]
+        pages = {ln.page_no for ln in group}
+        texts = Counter(re.sub(r"\d+", "#", ln.text) for ln in group)
+        coverage = len(pages) / page_count
+        if len(pages) < MIN_FURNITURE_PAGES or coverage < REPEATED_LINE_PAGE_RATIO:
+            continue
+        if len(texts) > max(1.0, MAX_FURNITURE_VARIANT_RATIO * len(pages)):
+            continue
+        repeated.append(
+            RepeatedLine(
+                text=texts.most_common(1)[0][0],
+                top=round(sum(cluster) / len(cluster), 1),
+                page_ratio=coverage,
+                variants=len(texts),
+            )
+        )
     return sorted(repeated, key=lambda r: r.top)
 
 
-# --- Detection -----------------------------------------------------------
+def _find_effective_dates(lines: list[Line]) -> list[EffectiveDate]:
+    """Collect the per-page effective date and docket stamp.
+
+    This is versioning metadata, not just furniture to strip: ISO-NE gives
+    effective dates at finer granularity than the document, so different sections
+    of one PDF can be in force from different dates.
+    """
+    counter: Counter[tuple[str, str]] = Counter()
+    for line in lines:
+        if match := _EFFECTIVE_DATE.search(line.text):
+            counter[(match.group("date").strip(), match.group("docket").strip())] += 1
+    return [
+        EffectiveDate(date_text=date, docket=docket, pages=n)
+        for (date, docket), n in counter.most_common()
+    ]
+
+
+def _find_toc_pages(lines: list[Line], furniture_tops: set[float]) -> set[int]:
+    """Identify contents pages, whose entries mimic headings perfectly.
+
+    A table of contents lists every section id with its title, which every
+    signal in the cascade reads as a genuine heading. Detect the page rather
+    than the line: a page densely packed with ids is a contents page.
+    """
+    by_page: dict[int, list[Line]] = defaultdict(list)
+    for line in lines:
+        if not _in_band(line.top, furniture_tops):
+            by_page[line.page_no].append(line)
+
+    toc: set[int] = set()
+    for page_no, page_lines in by_page.items():
+        if not page_lines:
+            continue
+        if any(line.text.strip().lower().startswith("table of contents") for line in page_lines):
+            toc.add(page_no)
+            continue
+        ids = sum(1 for line in page_lines if parse_section_id(line.text))
+        if len(page_lines) >= 5 and ids / len(page_lines) >= TOC_ID_DENSITY:
+            toc.add(page_no)
+    return toc
+
+
+# --- Detection ------------------------------------------------------------
 
 
 def _in_band(top: float, furniture_tops: set[float]) -> bool:
@@ -335,20 +544,32 @@ def _heading_shape(text: str, section_id: str) -> tuple[str, str | None]:
     """Split a line into its remainder and any hard disqualifying reason.
 
     The title-case rule is a *gate*, not a weighted signal. A heading's number is
-    essentially always followed by a title -- ``III.13.1 Qualification Process``
-    -- whereas wrapped prose reads ``III.14 shall be construed to limit...``.
-    Scoring these as merely "one weak signal short" lets them through, which is
-    what the first run against the fixtures showed. Missing an oddly-formatted
-    heading costs one section; admitting a false one corrupts every boundary
-    after it, so the asymmetry justifies a hard rule.
+    essentially always followed by a title -- ``III.13. Forward Capacity
+    Market.`` -- whereas wrapped prose reads ``III.14 shall be construed to
+    limit...``. Scoring these as merely one weak signal short lets them through.
+    Missing an oddly-formatted heading costs one section; admitting a false one
+    fabricates a section and corrupts every boundary after it.
+
+    Note that ISO-NE headings legitimately end in a period, so "ends with a
+    period" is *not* a prose signal here -- a sentence boundary *inside* the
+    remainder is.
     """
     remainder = text.strip()[len(section_id) :].strip(" .:—-")
     if not remainder:
         return "", None
+    # ISO-NE repeals subsections in place, leaving
+    # "III.13.1.1.2.5.2. [Reserved.]". These are genuine nodes of the section
+    # tree -- dropping them manufactures gaps and leaves the tree incomplete --
+    # but "[" is not an uppercase letter, so the title-case gate below rejects
+    # them unless they are recognised first.
+    if _RESERVED.match(remainder):
+        return remainder, None
     if not remainder[:1].isupper():
         return remainder, "remainder is lowercase prose, not a title"
-    if remainder.endswith(".") and len(remainder) > 60:
-        return remainder, "line is a terminated sentence, not a heading"
+    if len(remainder) > MAX_HEADING_REMAINDER:
+        return remainder, "remainder is too long to be a title"
+    if _MULTI_SENTENCE.search(remainder):
+        return remainder, "remainder spans a sentence boundary"
     return remainder, None
 
 
@@ -367,7 +588,7 @@ def _profile_fonts(lines: list[Line], furniture_tops: set[float]) -> FontProfile
         line
         for line in body_lines
         if (parsed := parse_section_id(line.text))
-        and _heading_shape(line.text, parsed[0])[1] is None
+        and _heading_shape(line.text, parsed.display)[1] is None
     ]
     distinct = bool(plausible) and sum(
         1
@@ -383,15 +604,14 @@ def _score_candidates(
     lines: list[Line],
     fonts: FontProfile,
     furniture_tops: set[float],
+    toc_pages: set[int],
 ) -> list[HeaderCandidate]:
     """Score each numbered line across independent signal families.
 
-    A single regex cannot separate a heading from a wrapped cross-reference, so
-    the prose gate runs first and the surviving lines are scored on the remaining
-    signals. When the document's headings are not typographically distinct, the
-    typography signal is dropped rather than scored as zero -- otherwise every
-    real heading in a flat document would be penalised for a property the
-    document simply does not have.
+    When the document's headings are not typographically distinct, the typography
+    signal is dropped rather than scored as zero -- otherwise every real heading
+    in a flat document would be penalised for a property the document does not
+    have.
     """
     candidates: list[HeaderCandidate] = []
     use_typography = fonts.headings_typographically_distinct
@@ -400,12 +620,27 @@ def _score_candidates(
         parsed = parse_section_id(line.text)
         if parsed is None:
             continue
-        section_id, sort_key = parsed
-        remainder, reason = _heading_shape(line.text, section_id)
 
+        if line.page_no in toc_pages:
+            candidates.append(
+                HeaderCandidate(
+                    line,
+                    parsed.display,
+                    parsed.sort_key,
+                    parsed.scheme,
+                    {},
+                    0.0,
+                    "on a table-of-contents page",
+                )
+            )
+            continue
+
+        remainder, reason = _heading_shape(line.text, parsed.display)
         if reason is not None:
             candidates.append(
-                HeaderCandidate(line, section_id, sort_key, {}, 0.0, rejected_reason=reason)
+                HeaderCandidate(
+                    line, parsed.display, parsed.sort_key, parsed.scheme, {}, 0.0, reason
+                )
             )
             continue
 
@@ -419,45 +654,131 @@ def _score_candidates(
             )
 
         score = sum(signals.values()) / len(signals)
-        candidates.append(HeaderCandidate(line, section_id, sort_key, signals, round(score, 3)))
+        candidates.append(
+            HeaderCandidate(
+                line, parsed.display, parsed.sort_key, parsed.scheme, signals, round(score, 3)
+            )
+        )
     return candidates
 
 
-def _validate_sequence(candidates: list[HeaderCandidate]) -> SequenceReport:
-    """Check that accepted ids form a monotone, depth-consistent sequence.
+def _longest_increasing(keys: list[tuple[int, ...]]) -> set[int]:
+    """Indices forming a longest strictly-increasing subsequence of ``keys``."""
+    tails: list[tuple[int, ...]] = []
+    tails_idx: list[int] = []
+    prev = [-1] * len(keys)
 
-    This is the strongest signal and the one naive parsers omit: a candidate that
-    breaks monotonicity is almost always a cross-reference, and a gap means a
-    real heading was missed.
+    for i, key in enumerate(keys):
+        pos = bisect.bisect_left(tails, key)
+        prev[i] = tails_idx[pos - 1] if pos > 0 else -1
+        if pos == len(tails):
+            tails.append(key)
+            tails_idx.append(i)
+        else:
+            tails[pos] = key
+            tails_idx[pos] = i
+
+    keep: set[int] = set()
+    node = tails_idx[-1] if tails_idx else -1
+    while node != -1:
+        keep.add(node)
+        node = prev[node]
+    return keep
+
+
+def _demote_out_of_sequence(candidates: list[HeaderCandidate]) -> tuple[list[HeaderCandidate], int]:
+    """Reclassify candidates that break the id sequence as cross-references.
+
+    Sequence consistency is the strongest signal in the cascade, and the point of
+    computing it is to *act* on it. Three passes:
+
+    1. A section id occurring more than once keeps only its best-scoring
+       occurrence -- the real heading beats a wrapped reference on typography.
+    2. Candidates are grouped by numbering scheme. ``Appendix A`` and
+       ``III.A.1`` are not mutually comparable, and validating them as one
+       sequence lets a stray id from one scheme invalidate the other entirely.
+    3. Within each scheme, keep a *longest increasing subsequence* rather than
+       walking greedily. A greedy walk lets one bad early acceptance set a high
+       watermark that demotes every legitimate heading after it -- which is
+       exactly what happened on the real corpus, costing 180 real headings in
+       Appendix A alone. An LIS drops the outlier instead of the tail.
+    """
+    result = list(candidates)
+    demoted = 0
+
+    best_by_id: dict[str, int] = {}
+    for idx, cand in enumerate(result):
+        if not cand.accepted:
+            continue
+        prior = best_by_id.get(cand.section_id)
+        if prior is None:
+            best_by_id[cand.section_id] = idx
+        elif cand.score > result[prior].score:
+            result[prior] = result[prior].demoted("duplicate section id, lower-scoring occurrence")
+            demoted += 1
+            best_by_id[cand.section_id] = idx
+        else:
+            result[idx] = cand.demoted("duplicate section id, lower-scoring occurrence")
+            demoted += 1
+
+    by_scheme: dict[str, list[int]] = defaultdict(list)
+    for idx, cand in enumerate(result):
+        if cand.accepted:
+            by_scheme[cand.scheme].append(idx)
+
+    for indices in by_scheme.values():
+        keep = _longest_increasing([result[i].sort_key for i in indices])
+        for position, idx in enumerate(indices):
+            if position not in keep:
+                result[idx] = result[idx].demoted("breaks the monotonic id sequence")
+                demoted += 1
+
+    return result, demoted
+
+
+def _validate_sequence(candidates: list[HeaderCandidate], demoted: int) -> SequenceReport:
+    """Report residual sequence problems, per numbering scheme.
+
+    Schemes are validated independently for the same reason they are demoted
+    independently: ``Appendix A`` and ``III.A.1`` have incomparable sort keys, so
+    interleaving them manufactures violations that are artefacts of the
+    comparison rather than defects in the document.
     """
     accepted = [c for c in candidates if c.accepted]
     violations: list[str] = []
     gaps: list[str] = []
 
-    previous: HeaderCandidate | None = None
-    for current in accepted:
-        if previous is not None:
-            if current.sort_key <= previous.sort_key:
-                violations.append(
-                    f"{current.section_id} (p.{current.line.page_no}) "
-                    f"does not follow {previous.section_id}"
-                )
-            elif len(current.sort_key) > len(previous.sort_key) + 1:
-                violations.append(
-                    f"{current.section_id} jumps more than one level below {previous.section_id}"
-                )
-            elif (
-                len(current.sort_key) == len(previous.sort_key)
-                and current.sort_key[:-1] == previous.sort_key[:-1]
-                and current.sort_key[-1] > previous.sort_key[-1] + 1
-            ):
-                gaps.append(f"{previous.section_id} -> {current.section_id}")
-        previous = current
+    by_scheme: dict[str, list[HeaderCandidate]] = defaultdict(list)
+    for cand in accepted:
+        by_scheme[cand.scheme].append(cand)
+
+    for group in by_scheme.values():
+        previous: HeaderCandidate | None = None
+        for current in group:
+            if previous is not None:
+                if current.sort_key <= previous.sort_key:
+                    violations.append(
+                        f"{current.section_id} (p.{current.line.page_no}) "
+                        f"does not follow {previous.section_id}"
+                    )
+                elif len(current.sort_key) > len(previous.sort_key) + 1:
+                    gaps.append(
+                        f"{previous.section_id} -> {current.section_id} "
+                        "(intermediate level missing)"
+                    )
+                elif (
+                    len(current.sort_key) == len(previous.sort_key)
+                    and current.sort_key[:-1] == previous.sort_key[:-1]
+                    and current.sort_key[-1] > previous.sort_key[-1] + 1
+                ):
+                    gaps.append(f"{previous.section_id} -> {current.section_id}")
+            previous = current
 
     return SequenceReport(
         accepted_ids=tuple(c.section_id for c in accepted),
         violations=tuple(violations),
         gaps=tuple(gaps),
+        demoted=demoted,
     )
 
 
@@ -481,7 +802,15 @@ def spike_document(pdf_path: Path) -> SpikeReport:
     """Run the full diagnostic cascade over one PDF."""
     lines, text_layer, page_height = _read_lines(pdf_path)
 
-    if not text_layer.has_text_layer:
+    if text_layer.is_reserved_placeholder or not text_layer.has_text_layer:
+        note = (
+            "Intentionally blank tariff section ([RESERVED]). Excluded from the corpus, "
+            "but nothing is lost -- there is no content to recover."
+            if text_layer.is_reserved_placeholder
+            else "No usable text layer -- this is a scan. Claude's citations require "
+            "extractable text, so it cannot be cited and must be dropped from the "
+            "corpus (state the exclusion in the README)."
+        )
         return SpikeReport(
             path=pdf_path,
             text_layer=text_layer,
@@ -490,19 +819,18 @@ def spike_document(pdf_path: Path) -> SpikeReport:
             candidates=(),
             sequence=None,
             cross_refs=CrossRefAudit(0, 0, 0),
-            notes=[
-                "No usable text layer -- this document is almost certainly a scan. "
-                "Claude's citations require extractable text, so it cannot be cited "
-                "and must be dropped from the corpus (state the exclusion in the README)."
-            ],
+            notes=[note],
         )
 
     repeated = _find_repeated_lines(lines, text_layer.page_count, page_height)
     furniture_tops = {r.top for r in repeated}
+    toc_pages = _find_toc_pages(lines, furniture_tops)
     fonts = _profile_fonts(lines, furniture_tops)
-    candidates = _score_candidates(lines, fonts, furniture_tops)
-    sequence = _validate_sequence(candidates)
+    candidates = _score_candidates(lines, fonts, furniture_tops, toc_pages)
+    candidates, demoted = _demote_out_of_sequence(candidates)
+    sequence = _validate_sequence(candidates, demoted)
     cross_refs = _audit_cross_refs(lines, candidates)
+    effective_dates = _find_effective_dates(lines)
 
     notes: list[str] = []
     if not fonts.headings_typographically_distinct:
@@ -524,8 +852,13 @@ def spike_document(pdf_path: Path) -> SpikeReport:
         )
     if sequence.violations:
         notes.append(
-            f"{len(sequence.violations)} sequence violation(s). Ids should increase "
-            "monotonically; violations usually mean false headings were admitted."
+            f"{len(sequence.violations)} sequence violation(s) survived demotion. "
+            "Inspect these: they usually mean an unsupported numbering scheme."
+        )
+    if len(effective_dates) > 1:
+        notes.append(
+            f"{len(effective_dates)} distinct effective dates in one document -- ISO-NE "
+            "versions at finer granularity than the file, so capture these per section."
         )
 
     return SpikeReport(
@@ -536,6 +869,8 @@ def spike_document(pdf_path: Path) -> SpikeReport:
         candidates=tuple(candidates),
         sequence=sequence,
         cross_refs=cross_refs,
+        toc_pages=tuple(sorted(toc_pages)),
+        effective_dates=tuple(effective_dates),
         notes=notes,
     )
 
@@ -545,6 +880,7 @@ def spike_document(pdf_path: Path) -> SpikeReport:
 _VERDICT_STYLE = {
     Verdict.GO: ("bold green", "structure is recoverable with the full cascade"),
     Verdict.DEGRADED: ("bold yellow", "usable, but a signal is unavailable or noisy"),
+    Verdict.EMPTY: ("dim", "intentionally blank tariff section; nothing to recover"),
     Verdict.NO_GO: ("bold red", "drop from the corpus and state the exclusion"),
 }
 
@@ -560,12 +896,12 @@ def render_report(report: SpikeReport, console: Console, *, show_candidates: int
     console.print(
         f"[bold]Text layer[/bold]  {layer.page_count} pages, "
         f"{layer.total_chars:,} chars, median {layer.median_chars_per_page:,.0f}/page, "
-        f"{layer.empty_page_ratio:.0%} near-empty"
+        f"{layer.image_page_ratio:.0%} of pages carry images"
     )
 
-    if report.verdict is Verdict.NO_GO:
+    if report.verdict in (Verdict.NO_GO, Verdict.EMPTY):
         for note in report.notes:
-            console.print(f"\n[red]![/red] {note}")
+            console.print(f"\n[{'red' if report.verdict is Verdict.NO_GO else 'dim'}]![/] {note}")
         return
 
     if report.fonts:
@@ -581,17 +917,30 @@ def render_report(report: SpikeReport, console: Console, *, show_candidates: int
         )
 
     if report.repeated_lines:
-        console.print("[bold]Furniture[/bold]  running header/footer detected:")
+        console.print("[bold]Furniture[/bold]  running header/footer positions:")
         for line in report.repeated_lines:
-            console.print(f"             top={line.top:6.1f}  {line.page_ratio:.0%}  {line.text!r}")
+            variants = f" ({line.variants} text variants)" if line.variants > 1 else ""
+            console.print(
+                f"             top={line.top:6.1f}  {line.page_ratio:.0%}{variants}  {line.text!r}"
+            )
     else:
         console.print("[bold]Furniture[/bold]  [yellow]none detected[/yellow]")
+
+    if report.effective_dates:
+        console.print("[bold]Versions[/bold]   effective dates stamped on pages:")
+        for eff in report.effective_dates[:6]:
+            console.print(f"             {eff.date_text}  docket {eff.docket}  ({eff.pages} pages)")
+
+    if report.toc_pages:
+        shown = ", ".join(str(p) for p in report.toc_pages[:12])
+        more = "" if len(report.toc_pages) <= 12 else f" (+{len(report.toc_pages) - 12} more)"
+        console.print(f"[bold]Contents[/bold]   pages excluded as TOC: {shown}{more}")
 
     cr = report.cross_refs
     misread_style = "green" if cr.misread_as_headings == 0 else "bold red"
     console.print(
         f"[bold]Xrefs[/bold]      {cr.inline_refs_seen} inline; "
-        f"{cr.prose_lines_starting_with_id} wrapped prose lines start with an id; "
+        f"{cr.prose_lines_starting_with_id} lines gated; "
         f"[{misread_style}]{cr.misread_as_headings} misread as headings[/{misread_style}]"
     )
 
@@ -599,11 +948,11 @@ def render_report(report: SpikeReport, console: Console, *, show_candidates: int
         seq = report.sequence
         console.print(
             f"[bold]Sequence[/bold]   {len(seq.accepted_ids)} headings accepted, "
-            f"{len(seq.violations)} violations, {len(seq.gaps)} gaps"
+            f"{seq.demoted} demoted, {len(seq.violations)} violations, {len(seq.gaps)} gaps"
         )
         for violation in seq.violations[:10]:
             console.print(f"             [red]violation[/red] {violation}")
-        for gap in seq.gaps[:10]:
+        for gap in seq.gaps[:6]:
             console.print(f"             [yellow]gap[/yellow] {gap}")
 
     if show_candidates:
@@ -620,14 +969,13 @@ def render_report(report: SpikeReport, console: Console, *, show_candidates: int
                 else "[dim]gated[/dim]"
             )
             detail = cand.rejected_reason or cand.line.text[:52]
-            row_style = None if cand.accepted else "dim"
             table.add_row(
                 cand.section_id,
                 str(cand.line.page_no),
                 f"{cand.score:.2f}",
                 signals,
                 detail,
-                style=row_style,
+                style=None if cand.accepted else "dim",
             )
         console.print()
         console.print(table)

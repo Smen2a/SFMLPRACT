@@ -105,24 +105,40 @@ _SENTENCE = (
     "with the schedule established by the ISO, and shall be determined to have "
     "satisfied the applicable requirement upon written confirmation."
 )
-# Repeated so each fixture spans several pages: the running header/footer
-# detector keys off text recurring at the same vertical position across pages,
-# which a single-page fixture would satisfy trivially and not actually test.
-_BODY = " ".join([_SENTENCE] * 6)
+
+
+def _paragraph(n: int) -> str:
+    """Body prose long enough to span pages, and varied line by line.
+
+    Varied deliberately: repeating one sentence verbatim makes body lines look
+    like running furniture (same text, same height, many pages), which real
+    tariff prose never does. An earlier version of this fixture repeated a
+    single sentence and produced exactly that false positive.
+    """
+    return " ".join(
+        f"In the {i + n}th instance, the Market Participant shall submit the "
+        f"documentation described in paragraph ({chr(97 + (i + n) % 26)}) within "
+        f"{10 * (i + n) % 90 + 5} days of the applicable deadline, and the ISO "
+        f"shall confirm receipt in writing."
+        for i in range(6)
+    )
+
+
+_BODY = _paragraph(0)
 
 _NESTED: list[Block] = [
     ("heading", "III.13 Forward Capacity Market"),
-    ("body", _BODY),
+    ("body", _paragraph(1)),
     ("heading", "III.13.1 Qualification Process"),
-    ("body", _BODY),
+    ("body", _paragraph(2)),
     ("heading", "III.13.1.1 New Capacity Qualification"),
-    ("body", _BODY),
+    ("body", _paragraph(3)),
     ("heading", "III.13.1.2 Existing Capacity Qualification"),
-    ("body", _BODY),
+    ("body", _paragraph(4)),
     ("heading", "III.13.2 Forward Capacity Auction"),
-    ("body", _BODY),
+    ("body", _paragraph(5)),
     ("heading", "III.14 Capacity Supply Obligation"),
-    ("body", _BODY),
+    ("body", _paragraph(6)),
 ]
 
 _XREF_BODY = (
@@ -132,13 +148,13 @@ _XREF_BODY = (
     "provisions of Appendix A shall continue to apply."
 )
 
-_LONG_XREF_BODY = " ".join([_XREF_BODY] * 4)
+_LONG_XREF_BODY = " ".join(f"{_XREF_BODY} Paragraph ({chr(97 + i)}) applies." for i in range(4))
 
 _XREF: list[Block] = [
     ("heading", "III.12 Definitions"),
-    ("body", _LONG_XREF_BODY),
+    ("body", _LONG_XREF_BODY + " Further terms follow below."),
     ("heading", "III.12.2 Capacity Supply Obligation"),
-    ("body", _LONG_XREF_BODY),
+    ("body", _LONG_XREF_BODY + " Additional terms are set out here."),
     ("heading", "III.13 Forward Capacity Market"),
     ("body", _LONG_XREF_BODY),
 ]
