@@ -50,10 +50,11 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-# ISO-NE stamps every tariff page with an en dash between the effective date
-# and the FERC docket number. These characters are corpus data we must match
-# literally, not typographic slips.
-allowed-confusables = ["–", "—"]
+# Characters that are corpus data, not typographic slips: ISO-NE stamps every
+# tariff page with an en dash between the effective date and the FERC docket
+# number, and its prose uses curly quotes throughout (964 right single quotes in
+# Market Rule 1 alone). Both must be matched and normalised literally.
+allowed-confusables = ["–", "—", "‘", "’", "“", "”"]
 
 [tool.mypy]
 python_version = "3.11"

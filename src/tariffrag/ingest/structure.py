@@ -81,6 +81,20 @@ consistent height. A running header repeats -- few variants across many pages
 body text differs on every page, giving roughly one variant per page.
 """
 
+MIN_SCHEME_MEMBERS = 2
+DOMINANT_SCHEME_MEMBERS = 5
+"""A numbering scheme with almost no members, beside a well-populated one, is noise.
+
+Per-scheme LIS cannot catch these: a scheme with a single member is trivially
+an increasing sequence. Measured across the corpus, every document has one
+dominant scheme (10-405 headings) and any other scheme present has exactly
+one member -- eight corpus-wide, all spurious, among them a stray "84.1" from
+a table and an "Appendix I" reference that took a sentence as its title.
+
+The rule is relative, not absolute: Appendix I is genuinely numbered in the
+``plain`` scheme with 48 headings, so no scheme can be rejected outright.
+"""
+
 TOC_ID_DENSITY = 0.5
 """A page where this fraction of lines parse as section ids is a contents page."""
 
@@ -100,12 +114,18 @@ HEADING_SCORE_THRESHOLD = 0.6
 
 _ROMAN = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
 
-_ROMAN_SEGMENTED = re.compile(r"^(?P<roman>[IVXLCDM]+)(?P<rest>(?:\.(?:\d+|[A-Z]))+)\b")
-"""Market Rule 1 numbering, in all three observed forms.
+_ROMAN_SEGMENTED = re.compile(r"^(?P<roman>[IVXLCDM]+)(?P<rest>(?:\.(?:\d+[A-Z]?|[A-Z]))+)\b")
+"""Market Rule 1 numbering, in all four observed forms.
 
-``III.13.1.2.3`` (body), ``III.A.1.1`` (appendix) and ``III.13.A.1`` (a lettered
-subsection inside a numbered one) differ only in whether a given segment is a
-number or a letter, so one pattern covers them rather than three.
+``III.13.1.2.3`` (body), ``III.A.1.1`` (appendix), ``III.13.A.1`` (a lettered
+subsection inside a numbered one) and ``III.13.1.4A`` (an amendment inserted
+between existing sections) differ only in how a segment is written, so one
+pattern covers them.
+
+The suffixed form matters more than its rarity suggests: 14 distinct ids use it,
+and they are substantive sections -- ``III.13.3.4A Termination of Capacity
+Supply Obligations`` among them. Truncating ``III.13.1.4A`` to ``III.13.1``
+would not merely lose the suffix, it would collide with the real ``III.13.1``.
 """
 
 _LETTERED = re.compile(r"^(?P<kind>Appendix|Attachment|Schedule)\s+(?P<letter>[A-Z])\b")
@@ -168,6 +188,29 @@ def _base_font(name: str) -> str:
     return _SUBSET_PREFIX.sub("", name)
 
 
+SEGMENT_SCALE = 100
+"""Numeric segments are scaled so a letter suffix can sort between integers.
+
+``4`` -> 400, ``4A`` -> 401, ``5`` -> 500, keeping 4 < 4A < 5.
+"""
+
+LETTER_SEGMENT_BASE = 1_000_000
+"""A bare-letter segment sorts above every numeric one at the same depth.
+
+Large enough to stay above scaled numbers: ``III.15`` is 1500, so the previous
+base of 1000 would have placed appendix ids below it.
+"""
+
+
+def _segment_key(segment: str) -> int:
+    """Order one id segment: ``4`` < ``4A`` < ``4B`` < ``5`` < ``A``."""
+    if segment.isdigit():
+        return int(segment) * SEGMENT_SCALE
+    if segment.isalpha():
+        return LETTER_SEGMENT_BASE + ord(segment)
+    return int(segment[:-1]) * SEGMENT_SCALE + (ord(segment[-1]) - ord("A") + 1)
+
+
 def _roman_to_int(text: str) -> int | None:
     total, prev = 0, 0
     for char in reversed(text.upper()):
@@ -200,6 +243,8 @@ def parse_section_id(text: str) -> ParsedId | None:
     'III.13.1.2'
     >>> parse_section_id("III.A.1.1 Mission Statement").scheme
     'roman_letter'
+    >>> parse_section_id("III.13.1.4A Distributed Energy").display
+    'III.13.1.4A'
     >>> parse_section_id("The Market Participant shall")
     """
     stripped = text.strip()
@@ -210,9 +255,7 @@ def parse_section_id(text: str) -> ParsedId | None:
             return None
         rest = match.group("rest")
         segments = [part for part in rest.split(".") if part]
-        # Letters sort above numbers at the same depth, so a lettered segment can
-        # never collide with a numbered one.
-        key = tuple(int(seg) if seg.isdigit() else 1000 + ord(seg) for seg in segments)
+        key = tuple(_segment_key(seg) for seg in segments)
         # Only the appendix form -- a letter directly after the roman major -- is
         # a separate numbering scheme. A lettered segment deeper in the tree
         # belongs to the body sequence and must be validated alongside it.
@@ -228,7 +271,7 @@ def parse_section_id(text: str) -> ParsedId | None:
         # A bare integer is far more often a page number or list marker.
         if "." not in num:
             return None
-        return ParsedId(num, tuple(int(part) for part in num.split(".")), "plain")
+        return ParsedId(num, tuple(_segment_key(part) for part in num.split(".")), "plain")
 
     return None
 
@@ -759,7 +802,10 @@ def _demote_out_of_sequence(candidates: list[HeaderCandidate]) -> tuple[list[Hea
     2. Candidates are grouped by numbering scheme. ``Appendix A`` and
        ``III.A.1`` are not mutually comparable, and validating them as one
        sequence lets a stray id from one scheme invalidate the other entirely.
-    3. Within each scheme, keep a *longest increasing subsequence* rather than
+    3. A scheme with almost no members, beside a well-populated one, is dropped
+       wholesale -- per-scheme LIS cannot catch it, since one member is trivially
+       an increasing sequence.
+    4. Within each scheme, keep a *longest increasing subsequence* rather than
        walking greedily. A greedy walk lets one bad early acceptance set a high
        watermark that demotes every legitimate heading after it -- which is
        exactly what happened on the real corpus, costing 180 real headings in
@@ -787,6 +833,17 @@ def _demote_out_of_sequence(candidates: list[HeaderCandidate]) -> tuple[list[Hea
     for idx, cand in enumerate(result):
         if cand.accepted:
             by_scheme[cand.scheme].append(idx)
+
+    dominant = max((len(v) for v in by_scheme.values()), default=0)
+    if dominant >= DOMINANT_SCHEME_MEMBERS:
+        for scheme, indices in list(by_scheme.items()):
+            if len(indices) < MIN_SCHEME_MEMBERS:
+                for idx in indices:
+                    result[idx] = result[idx].demoted(
+                        f"lone {scheme} id beside a dominant numbering scheme"
+                    )
+                    demoted += 1
+                del by_scheme[scheme]
 
     for indices in by_scheme.values():
         keep = _longest_increasing([result[i].sort_key for i in indices])
@@ -831,7 +888,10 @@ def _validate_sequence(candidates: list[HeaderCandidate], demoted: int) -> Seque
                 elif (
                     len(current.sort_key) == len(previous.sort_key)
                     and current.sort_key[:-1] == previous.sort_key[:-1]
-                    and current.sort_key[-1] > previous.sort_key[-1] + 1
+                    # Consecutive siblings differ by one scale step, so anything
+                    # larger means a sibling is missing. Suffixed amendments sit
+                    # inside a step (4 -> 4A is +1), so they are not gaps.
+                    and current.sort_key[-1] - previous.sort_key[-1] > SEGMENT_SCALE
                 ):
                     gaps.append(f"{previous.section_id} -> {current.section_id}")
             previous = current

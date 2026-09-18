@@ -38,6 +38,7 @@ __all__ = [
     "DocType",
     "Document",
     "EffectiveDate",
+    "IngestRecord",
     "Origin",
     "RevisionSource",
     "Section",
@@ -249,6 +250,37 @@ class Document:
 
 
 @dataclass(frozen=True, slots=True)
+class IngestRecord:
+    """What an ingest run produced, and the versions it produced it under.
+
+    Holds the fields deliberately kept out of :class:`Document`, because they
+    only exist once extraction has actually run. Phase 2 checks this before
+    building an index: every stored offset is relative to a specific canonical
+    text produced by specific code, so a library upgrade that silently changes
+    extraction must fail loudly rather than shift citations by a few characters.
+    """
+
+    doc_id: str
+    sha256_pdf: str
+    sha256_canonical_text: str
+    extractor: str
+    extractor_version: str
+    chunker_version: str
+    page_count: int
+    pages_kept: int
+    excluded_toc_pages: tuple[int, ...]
+    section_count: int
+    coverage: float
+    """Share of canonical text assigned to a section."""
+    xref_count: int
+    xref_resolved: int
+
+    @property
+    def xref_rate(self) -> float:
+        return self.xref_resolved / self.xref_count if self.xref_count else 1.0
+
+
+@dataclass(frozen=True, slots=True)
 class Section:
     """One node of a document's numbered hierarchy."""
 
@@ -335,10 +367,13 @@ class CrossReference:
     """An intra-corpus reference such as ``as defined in Section III.12.2``.
 
     Resolution rate doubles as a parser-quality metric: if a large share of
-    references fail to resolve, the section tree is wrong.
+    references fail to resolve, the section tree is wrong. It is the only check
+    that grades the tree against the document's own internal claims rather than
+    against our expectations of it.
     """
 
-    from_chunk_id: str
+    from_doc_id: str
+    from_section_id: str
     raw_text: str
     char_start: int
     char_end: int

@@ -127,16 +127,21 @@ def test_source_uri_is_stable_and_carries_no_url() -> None:
 
 def test_cross_reference_resolution_flag() -> None:
     unresolved = CrossReference(
-        from_chunk_id="c-1", raw_text="Section III.12.2", char_start=0, char_end=16
+        from_doc_id="isone:mr1:sec_13_14",
+        from_section_id="III.13.1",
+        raw_text="Section III.12.2",
+        char_start=0,
+        char_end=16,
     )
     assert not unresolved.resolved
 
     resolved = CrossReference(
-        from_chunk_id="c-1",
+        from_doc_id="isone:mr1:sec_13_14",
+        from_section_id="III.13.1",
         raw_text="Section III.12.2",
         char_start=0,
         char_end=16,
-        to_doc_id="isone:mr1",
+        to_doc_id="isone:mr1:sec_1_12",
         to_section_id="III.12.2",
     )
     assert resolved.resolved

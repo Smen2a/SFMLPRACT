@@ -79,7 +79,7 @@ LangChain / LlamaIndex (they would hide chunking, fusion, and citation mapping �
 - [x] **0a** Project scaffold, data model, lint/type/test tooling, CI
 - [x] **0b** Parser spike, validated against the real Market Rule 1 corpus
 - [x] **0c** Content-hashed manifest, with per-section effective dates and docket numbers
-- [ ] **1** Extraction → canonical text + page map → section tree → parse report
+- [x] **1** Extraction → canonical text + page map → section tree → cross-reference resolution
 - [ ] **2** Chunker, FTS5, embeddings, sqlite-vec, weighted RRF
 - [ ] **3** First ~30 gold questions and the Layer-1 retrieval eval
 - [ ] **4** `search_result` assembly, the answer call, grounding verification
@@ -115,6 +115,40 @@ Three properties are deliberate:
 **Effective dates are per section, not per document.** Sections 13–14 carry four stamps covering pages `6-102`, `4-5,103-182,232-235`, `206-230` and `1-3`. `Document.cite_label(page=N)` resolves the stamp governing that page, so a citation to page 1 reports March 2026 while the document's primary date is May 2025.
 
 Status is machine-readable (`active` / `reserved` / `excluded`), so Phase 1 skips the four reserved appendices without a hard-coded list. `reserved` is kept distinct from `excluded` for the same reason `EMPTY` is distinct from `NO_GO`: one loses nothing, the other loses content.
+
+## Ingestion
+
+`tariffrag ingest` turns the 12 active documents into canonical text, section trees and cross-references. Reserved documents are skipped by reading their status from the manifest, not from a hard-coded list.
+
+```bash
+tariffrag ingest                              # canonical text + sections + xrefs
+tariffrag outline isone:mr1:sec_13_14 -d 3    # section tree with page spans
+```
+
+| | |
+|---|---|
+| Sections recovered | **1,260** across 12 documents, nesting to depth 9 |
+| Text assigned to a section | **100%** on every document |
+| Cross-references resolved | **91.7%** (2,211 of 2,411) |
+| Offset round-trip | every section's span starts with its own id; every recorded page agrees with resolving its start offset |
+
+**Canonical text is the coordinate system.** One text file per document with page furniture removed and normalisation applied exactly once; character offsets are assigned after that and never recomputed at query time, because normalising later would shift offsets underneath stored spans. A layout file records where each page and source line landed, so an offset resolves back to a page.
+
+Contents pages are excluded from canonical text and the exclusion recorded — Sections 1–12 open with a genuine 33-page contents listing whose entries duplicate every heading in the document, which is real content but poor retrieval material.
+
+**Normalisation is smaller than the textbook version, because each step was measured.** Ligatures, soft hyphens and non-breaking spaces do not occur in Market Rule 1 at all, so nothing handles them. Curly quotes are flattened so lexical search matches what a user types. En dashes are kept — they carry meaning in ranges and date stamps.
+
+**Line-broken words are deliberately *not* re-joined.** The usual rule — join when a line ends in a hyphen — is destructive on a tariff. Across the 147 end-of-line hyphens in the two largest documents, the hyphenated form is more common elsewhere **141 times and the joined form 0 times**: `De-List` 490 against 1, `Real-Time` 374 against 0, `Rest-of-Pool` and `Non-Spinning` likewise. These are Defined Terms, and de-hyphenating them would break exact-match retrieval on the terms carrying the most weight.
+
+**Cross-reference resolution is a parser-quality metric, not a feature.** It grades the section tree against the document's own internal claims rather than against our expectations, and it is the check that caught the defect below. Query-time expansion comes later. The unresolved ~8% are genuinely outside the corpus — Section I of the tariff, other manuals — which is a scope fact.
+
+### What the xref rate caught
+
+ISO-NE inserts amendments as **suffixed sections** rather than renumbering: `III.13.1.4A Distributed Energy Capacity Resources`, `III.13.3.4A Termination of Capacity Supply Obligations`. The id parser truncated `III.13.1.4A` to `III.13.1` — not merely losing the suffix but colliding with the real `III.13.1`. Fourteen distinct suffixed ids occur, all substantive sections. Supporting them recovered 35 headings and lifted resolution from 87% to 92%.
+
+Segment sort keys are scaled so a suffix sorts inside the gap between integers (`4` < `4A` < `4B` < `5`). Tests assert that ordering rather than the encoding, so the representation can change without rewriting a table of magic numbers.
+
+A second defect surfaced in the same pass: a numbering scheme with a lone member beside a well-populated one is noise — a stray `84.1` from a table, an `Appendix I` reference that took a sentence as its title. Per-scheme LIS cannot catch these, since one member is trivially an increasing sequence. Eight corpus-wide, now demoted. The rule is relative, not absolute: Appendix I is genuinely numbered in the `plain` scheme with 48 headings.
 
 ## The parser spike
 

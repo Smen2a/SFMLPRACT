@@ -18,6 +18,7 @@ from rich.table import Table
 from tariffrag import __version__
 from tariffrag.config import settings
 from tariffrag.ingest import manifest as manifest_mod
+from tariffrag.ingest import pipeline as pipeline_mod
 from tariffrag.ingest.spike import Verdict, render_report, spike_document
 
 app = typer.Typer(
@@ -167,6 +168,83 @@ def manifest_diff() -> None:
         console.print(f"  [yellow]changed[/yellow]  {doc_id}")
     console.print("\nRun `tariffrag manifest build` to update the record.")
     raise typer.Exit(code=1)
+
+
+@app.command()
+def ingest() -> None:
+    """Extract canonical text, section trees and cross-references.
+
+    Skips reserved and excluded documents by reading their status from the
+    manifest rather than any hard-coded list.
+    """
+    if not settings.manifest_path.exists():
+        console.print("[red]No manifest.[/red] Run `tariffrag manifest build` first.")
+        raise typer.Exit(code=2)
+
+    built = manifest_mod.load(settings.manifest_path)
+    records = pipeline_mod.ingest_corpus(built, settings.repo_root, settings.text_dir)
+
+    table = Table(title=f"Ingested {len(records)} documents")
+    table.add_column("doc id", style="cyan", no_wrap=True)
+    table.add_column("pages", justify="right")
+    table.add_column("sections", justify="right")
+    table.add_column("coverage", justify="right")
+    table.add_column("xrefs", justify="right")
+    table.add_column("resolved", justify="right")
+
+    for record in records:
+        pages = f"{record.pages_kept}/{record.page_count}"
+        coverage = f"{record.coverage:.1%}"
+        table.add_row(
+            record.doc_id,
+            pages,
+            str(record.section_count),
+            f"[green]{coverage}[/green]"
+            if record.coverage >= 0.95
+            else f"[yellow]{coverage}[/yellow]",
+            str(record.xref_count),
+            f"{record.xref_rate:.0%}",
+        )
+    console.print(table)
+
+    total_refs = sum(r.xref_count for r in records)
+    resolved = sum(r.xref_resolved for r in records)
+    worst = min((r.coverage for r in records), default=1.0)
+    console.print(
+        f"\nCross-references resolved corpus-wide: [bold]{resolved}/{total_refs}"
+        f"[/bold] ({resolved / total_refs:.1%}); lowest coverage {worst:.1%}."
+    )
+
+
+@app.command()
+def outline(
+    doc_id: Annotated[str, typer.Argument(help="Document id, e.g. isone:mr1:sec_13_14")],
+    max_depth: Annotated[int, typer.Option("--max-depth", "-d")] = 4,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 60,
+) -> None:
+    """Print a document's section tree with page spans."""
+    try:
+        sections = pipeline_mod.load_sections(doc_id, settings.text_dir)
+    except FileNotFoundError:
+        console.print(f"[red]Not ingested:[/red] {doc_id}. Run `tariffrag ingest` first.")
+        raise typer.Exit(code=2) from None
+
+    shown = 0
+    for section in sections:
+        if section.depth > max_depth:
+            continue
+        if shown >= limit:
+            console.print(f"[dim]... {len(sections) - shown} more sections[/dim]")
+            break
+        indent = "  " * max(0, section.depth - 1)
+        pages = (
+            f"p{section.page_start}"
+            if section.page_start == section.page_end
+            else f"p{section.page_start}-{section.page_end}"
+        )
+        label = section.section_id or "(front matter)"
+        console.print(f"{indent}[cyan]{label}[/cyan]  {section.heading}  [dim]{pages}[/dim]")
+        shown += 1
 
 
 if __name__ == "__main__":  # pragma: no cover

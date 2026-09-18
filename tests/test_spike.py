@@ -55,22 +55,62 @@ def scanned() -> SpikeReport:
 
 
 @pytest.mark.parametrize(
-    ("text", "display", "sort_key", "scheme"),
+    ("text", "display", "scheme"),
     [
-        ("III.13.1.2 Qualification Process", "III.13.1.2", (3, 13, 1, 2), "roman_dotted"),
-        ("III.13. Forward Capacity Market.", "III.13", (3, 13), "roman_dotted"),
-        ("III.A.1.1 Mission Statement", "III.A.1.1", (3, 1065, 1, 1), "roman_letter"),
-        ("III.A.1. Introduction", "III.A.1", (3, 1065, 1), "roman_letter"),
-        ("2.1.3 Scheduling", "2.1.3", (2, 1, 3), "plain"),
-        ("Appendix A Auction Rules", "Appendix A", (65,), "lettered"),
+        ("III.13.1.2 Qualification Process", "III.13.1.2", "roman_dotted"),
+        ("III.13. Forward Capacity Market.", "III.13", "roman_dotted"),
+        ("III.A.1.1 Mission Statement", "III.A.1.1", "roman_letter"),
+        ("III.A.1. Introduction", "III.A.1", "roman_letter"),
+        ("III.13.1.4A Distributed Energy Capacity Resources", "III.13.1.4A", "roman_dotted"),
+        ("2.1.3 Scheduling", "2.1.3", "plain"),
+        ("Appendix A Auction Rules", "Appendix A", "lettered"),
     ],
 )
-def test_parses_section_ids(
-    text: str, display: str, sort_key: tuple[int, ...], scheme: str
-) -> None:
+def test_parses_section_ids(text: str, display: str, scheme: str) -> None:
+    """The display id and scheme are the contract; the sort key encoding is not.
+
+    Ordering is asserted separately, so the encoding can change without
+    rewriting a table of magic integers.
+    """
     parsed = parse_section_id(text)
     assert parsed is not None
-    assert (parsed.display, parsed.sort_key, parsed.scheme) == (display, sort_key, scheme)
+    assert (parsed.display, parsed.scheme) == (display, scheme)
+
+
+@pytest.mark.parametrize(
+    ("lower", "higher"),
+    [
+        ("III.13.1.4 A", "III.13.1.4A B"),
+        ("III.13.1.4A A", "III.13.1.4B B"),
+        ("III.13.1.4B A", "III.13.1.5 B"),
+        ("III.13.9 A", "III.13.10 B"),
+        ("III.15.1 A", "III.A.1 B"),
+    ],
+)
+def test_section_ids_sort_in_document_order(lower: str, higher: str) -> None:
+    """``4`` < ``4A`` < ``4B`` < ``5``, and appendix ids sort above numbered ones.
+
+    ISO-NE inserts amendments as suffixed sections rather than renumbering, so a
+    suffix has to sort inside the gap between two integers.
+    """
+    a, b = parse_section_id(lower), parse_section_id(higher)
+    assert a is not None and b is not None
+    assert a.sort_key < b.sort_key
+
+
+def test_suffixed_ids_are_not_truncated() -> None:
+    """Truncating ``III.13.1.4A`` to ``III.13.1`` would collide with a real section.
+
+    Fourteen distinct suffixed ids occur in the corpus, and they are substantive
+    -- ``III.13.3.4A Termination of Capacity Supply Obligations`` among them.
+    """
+    parsed = parse_section_id("III.13.3.4A Termination of Capacity Supply Obligations")
+    assert parsed is not None
+    assert parsed.display == "III.13.3.4A"
+
+    plain = parse_section_id("III.13.3.4 Something Else")
+    assert plain is not None
+    assert parsed.sort_key != plain.sort_key
 
 
 @pytest.mark.parametrize(
