@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+pipeline/raw/
+
+# Web
+node_modules/
+web/dist/
+web/dist-single/
+*.log
+.DS_Store

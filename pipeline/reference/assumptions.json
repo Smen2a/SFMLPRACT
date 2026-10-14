@@ -1,0 +1,31 @@
+{
+  "_comment": "Hand-set modelling assumptions. Prices themselves come from EIA files in build.py; these are the constants that turn them into a scenario model.",
+  "baseline_year": 2022,
+  "electric_supply_share": {
+    "value": {"Eversource": 0.44, "UI": 0.44, "Municipal": 0.5, "Eversource + Municipal": 0.44},
+    "source": "Approximate generation (standard service) share of the 2022 residential bill: Eversource/UI standard service averaged roughly 10-11 c/kWh in 2022 vs a 24.61 c/kWh all-in average (EIA). Municipal utilities buy through CMEEC and have lower delivery charges, so supply is a larger share."
+  },
+  "generation": {
+    "source": "Baseline shares: ISO New England 2024 net energy for load (gas 51%, nuclear 23%, net imports 9%, hydro 7%, solar 4%, wind 3%, other ~3%). Costs are illustrative all-in $/MWh energy costs for comparing mixes, not market prices.",
+    "sources": [
+      {"key": "gas", "label": "Natural gas", "share": 51, "cost": 72},
+      {"key": "nuclear", "label": "Nuclear", "share": 23, "cost": 50},
+      {"key": "imports", "label": "Imports (mostly Québec hydro)", "share": 9, "cost": 62},
+      {"key": "hydro", "label": "In-region hydro", "share": 7, "cost": 55},
+      {"key": "solar", "label": "Solar", "share": 4, "cost": 68},
+      {"key": "wind", "label": "Onshore wind", "share": 3, "cost": 60},
+      {"key": "offshore", "label": "Offshore wind", "share": 0, "cost": 98},
+      {"key": "other", "label": "Other (oil, refuse, wood)", "share": 3, "cost": 110}
+    ]
+  },
+  "heating": {
+    "oil_btu_per_gal": 138500,
+    "propane_btu_per_gal": 91500,
+    "oil_efficiency": 0.83,
+    "propane_efficiency": 0.9,
+    "btu_per_kwh": 3412,
+    "default_heat_pump_cop": 2.8
+  },
+  "solar": {"default_cost_cents_per_kwh": 12.0},
+  "burden_threshold": 0.06
+}
