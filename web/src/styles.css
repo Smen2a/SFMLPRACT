@@ -75,7 +75,9 @@ h3 {
 .app {
   max-width: 1680px;
   margin: 0 auto;
-  padding: 20px 16px 32px;
+  padding-block: 20px 32px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
 }
 .top {
   display: flex;
